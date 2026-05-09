@@ -1,0 +1,41 @@
+# Multi-task YOLOv13 training config (consumed by yolov13_multitask.engine.train)
+
+epochs: 200
+batch: 16
+imgsz: 640
+optimizer: AdamW
+lr0: 0.001
+lrf: 0.01
+weight_decay: 0.0005
+warmup_epochs: 3
+warmup_momentum: 0.8
+warmup_bias_lr: 0.1
+momentum: 0.937
+
+# Detection head internal gains (passed straight to v8DetectionLoss)
+box: 7.5
+cls: 0.5
+dfl: 1.5
+
+# Top-level multi-task weights
+loss_weights: { det: 1.0, da: 1.0, ll: 1.0 }
+use_uncertainty_weighting: false
+
+# Training behaviour
+freeze_backbone_epochs: 0
+mosaic: 0.5
+fliplr: 0.5
+hsv_p: 0.5
+bc_p: 0.3
+blur_p: 0.1
+noise_p: 0.1
+affine_p: 0.5
+
+# Logging / IO
+save_period: -1   # save_last only
+patience: 50
+seed: 0
+amp: true
+project: runs/multitask
+name: exp
+exist_ok: false
