@@ -57,6 +57,11 @@ class YOLOv13MultiTask(DetectionModel):
         # already-built graph.  This avoids hardcoding scale-dependent channels.
         ch_p3, ch_p4, ch_p5 = self._infer_fpn_channels(ch)
 
+        # Promote nc to a top-level attribute. Upstream DetectionModel relies on the
+        # trainer to set this; if a checkpoint is loaded outside the trainer (e.g.
+        # in the predictor) we still want self.model.nc to work.
+        self.nc = int(self.yaml.get("nc", nc or 0))
+
         self.da_classes = int(da_classes)
         self.ll_classes = int(ll_classes)
         self.da_decoder = FPNFusedSegDecoder((ch_p3, ch_p4, ch_p5), self.da_classes, mid_ch=decoder_mid_ch)

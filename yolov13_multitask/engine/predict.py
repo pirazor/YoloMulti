@@ -67,7 +67,13 @@ class MultiTaskPredictor:
                 "Pass a checkpoint produced by yolov13_multitask training."
             )
         self.model = self.model.float().to(self.device).eval()
-        self.names = names or list(getattr(self.model, "names", {i: str(i) for i in range(self.model.nc)}).values())
+        # Resolve nc without relying on .nc (DetectionModel only sets it through the trainer).
+        nc = self.model.yaml.get("nc") if hasattr(self.model, "yaml") else None
+        if nc is None:
+            nc = getattr(self.model.model[-1], "nc", 0)
+        self.names = names or list(
+            getattr(self.model, "names", {i: str(i) for i in range(int(nc))}).values()
+        )
 
     # ------------------------------------------------------------------ predict
     @torch.no_grad()
