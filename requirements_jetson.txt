@@ -1,0 +1,7 @@
+# Jetson Orin Nano (aarch64). Do NOT pip-install torch / tensorrt from PyPI here:
+#  - JetPack 6.2 : use NVIDIA's JetPack-6 torch wheel; TensorRT 10.3 ships with the OS.
+#  - JetPack 7.2 : torch cu132 aarch64 wheel; TensorRT 10.16 ships with the OS.
+# Inference only needs the engine + the runner; ultralytics is optional.
+numpy
+opencv-python-headless
+pyyaml

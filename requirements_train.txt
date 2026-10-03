@@ -1,0 +1,9 @@
+# Desktop / server training (x86_64, CUDA). Install the CUDA build of torch first, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+ultralytics==8.4.171
+timm>=1.0.20          # frozen DINOv3 / DINOv2 teacher
+onnx
+onnxruntime
+onnxslim
+opencv-python-headless
+pytest
