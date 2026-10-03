@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=70.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adas-mt"
+dynamic = ["version"]
+description = "Efficient multi-task ADAS perception (detection + drivable area + lane) for Jetson Orin Nano"
+requires-python = ">=3.10"
+dependencies = [
+    "ultralytics==8.4.171",
+    "numpy",
+    "opencv-python-headless",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+train = ["timm>=1.0.20", "tensorboard"]
+export = ["onnx", "onnxruntime", "onnxslim"]
+dev = ["pytest"]
+
+[tool.setuptools.dynamic]
+version = { attr = "adas_mt.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["adas_mt*", "sign_classifier*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

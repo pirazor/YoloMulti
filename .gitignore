@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+runs/
+*.pt
+*.engine
+*.onnx
+tests/_out/
+.pytest_cache/
+*.egg-info/
