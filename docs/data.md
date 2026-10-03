@@ -12,6 +12,13 @@ root/data.yaml                         nc, names, da_classes, da_names, ll_class
 when some images were annotated for only one task; the loss then ignores that task for them.
 `--lane_thickness` is the lane line width in px at 720p (default 8, scaled with image height).
 
+## Train/val split
+If the Supervisely dump has no `train/` / `val/` folders, the converter splits itself.
+- `--val_fraction 0` gives no val images (`data.yaml` then validates on `images/train`, with a warning).
+- A per-image random split leaks: neighbouring frames of one clip land in both sets and inflate
+  val metrics. Pass `--group_regex` (first group = clip id, e.g. `'^([0-9a-f]{8})-'` for BDD-style
+  names) to split whole clips.
+
 ## One packed mask, upstream augmentation
 Ultralytics 8.4 already warps a single `semantic_mask` together with image and boxes (Mosaic,
 RandomPerspective, RandomFlip, LetterBox: nearest interpolation, 255 = ignore padding). We pack

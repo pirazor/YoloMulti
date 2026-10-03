@@ -205,6 +205,42 @@ def _split_for_path(p: Path, src_root: Path) -> Optional[str]:
     return None
 
 
+def assign_val(
+    names: Sequence[str], val_fraction: float, seed: int = 0, group_regex: Optional[str] = None
+) -> set:
+    """Return the set of indices (into ``names``) that go to the val split.
+
+    ``val_fraction == 0`` -> no val images (the old ``max(1, ...)`` forced one). With
+    ``group_regex`` (first capture group = clip/sequence id, e.g. ``^([0-9a-f]{8})-`` for BDD
+    names) whole groups are assigned, so consecutive frames of one clip never straddle
+    train/val. Without it the split is per image, which leaks near-duplicate frames.
+    """
+    n = len(names)
+    if val_fraction <= 0 or n == 0:
+        return set()
+    target = max(1, int(round(n * val_fraction))) if n > 1 else 0
+    rng = random.Random(seed)
+    if group_regex:
+        import re
+
+        rx = re.compile(group_regex)
+        groups: Dict[str, List[int]] = defaultdict(list)
+        for i, nm in enumerate(names):
+            m = rx.search(nm)
+            groups[m.group(1) if m else nm].append(i)  # no match -> its own group
+        keys = sorted(groups)
+        rng.shuffle(keys)
+        val: set = set()
+        for k in keys:
+            if len(val) >= target:
+                break
+            val.update(groups[k])
+        return val
+    idx = list(range(n))
+    rng.shuffle(idx)
+    return set(idx[:target])
+
+
 def _walk_supervisely(src: Path) -> List[Path]:
     return sorted(src.rglob("*.json"))
 
@@ -383,6 +419,7 @@ def convert(
     limit: Optional[int] = None,
     lane_thickness: float = 8.0,
     partial_annotation: bool = False,
+    group_regex: Optional[str] = None,
 ) -> ConvertStats:
     src = Path(src).resolve()
     dst = Path(dst).resolve()
@@ -422,17 +459,21 @@ def convert(
 
     have_split = any(s is not None for _, _, s in paired)
     if not have_split:
-        rng = random.Random(seed)
-        all_idx = list(range(len(paired)))
-        rng.shuffle(all_idx)
-        n_val = max(1, int(round(len(paired) * val_fraction)))
-        val_set = set(all_idx[:n_val])
+        val_set = assign_val([ip.stem for _, ip, _ in paired], val_fraction, seed, group_regex)
+        if val_fraction > 0 and not group_regex:
+            LOGGER.warning(
+                "random per-image split: consecutive frames of one clip can land in both train and val "
+                "(leakage). Pass --group_regex to split by clip id."
+            )
         paired = [
             (jp, ip, "val" if i in val_set else "train") for i, (jp, ip, _) in enumerate(paired)
         ]
     else:
-        # default any unknown to train
+        n_unknown = sum(1 for _, _, s in paired if s is None)
+        if n_unknown:
+            LOGGER.warning("%d files outside train/val folders default to train", n_unknown)
         paired = [(jp, ip, s or "train") for jp, ip, s in paired]
+    has_val = any(sp == "val" for _, _, sp in paired)
 
     stats = ConvertStats()
     for jp, ip, split in paired:
@@ -468,7 +509,7 @@ def convert(
     data_yaml = {
         "path": str(dst),
         "train": "images/train",
-        "val": "images/val",
+        "val": "images/val" if has_val else "images/train",  # no val images -> validate on train (warned)
         "nc": len(det_classes),
         "names": det_classes,
         "da_classes": len(DA_NAMES),
@@ -479,6 +520,8 @@ def convert(
     with (dst / "data.yaml").open("w", encoding="utf-8") as f:
         yaml.safe_dump(data_yaml, f, sort_keys=False)
 
+    if not has_val:
+        LOGGER.warning("no val images: data.yaml 'val' points at images/train (metrics will be optimistic)")
     LOGGER.info(
         "done: %d images, %d boxes, %d DA polys, %d LL polys, %d skipped degenerate, %d unknown-tag-parses",
         stats.images,
@@ -504,7 +547,11 @@ def build_parser(p: Optional[argparse.ArgumentParser] = None) -> argparse.Argume
         help="style: 1=solid 2=dashed; type: id per laneType value",
     )
     p.add_argument("--split_tl_by_color", action="store_true")
-    p.add_argument("--val_fraction", type=float, default=0.1)
+    p.add_argument("--val_fraction", type=float, default=0.1, help="0 disables the val split")
+    p.add_argument(
+        "--group_regex", type=str, default=None,
+        help="split whole clips: regex whose 1st group is the clip id, e.g. '^([0-9a-f]{8})-' for BDD names",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--symlink",
@@ -534,6 +581,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         limit=args.limit,
         lane_thickness=args.lane_thickness,
         partial_annotation=args.partial_annotation,
+        group_regex=args.group_regex,
     )
     return 0
 
