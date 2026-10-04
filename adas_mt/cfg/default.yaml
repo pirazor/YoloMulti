@@ -1,0 +1,49 @@
+# adas_mt training config. Two sections:
+#   train: ordinary Ultralytics arguments (anything `yolo train` accepts); CLI flags override them
+#   mt:    multi-task settings that Ultralytics would reject (see adas_mt/engine/config.py)
+train:
+  epochs: 100
+  batch: 32
+  imgsz: 640              # max side (Ultralytics wants an int); the real (h, w) is mt.imgsz
+  optimizer: AdamW        # explicit: `auto` switches to MuSGD and overrides lr0 on long runs
+  lr0: 0.001
+  lrf: 0.01
+  momentum: 0.9
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  cos_lr: false
+  close_mosaic: 10
+  patience: 30
+  amp: true               # 'bf16' on A100/H100 skips the fp16 AMP check
+  nms: false              # validate the NMS-free head that ships (the default None validates o2m + NMS)
+  multi_scale: 0.0
+  # ADAS-safe augmentation: keep traffic-light colours, no big rotations, no vertical flip
+  mosaic: 1.0
+  mixup: 0.0
+  fliplr: 0.5
+  flipud: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.5
+  hsv_v: 0.3
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  box: 7.5
+  cls: 0.5
+  dfl: 1.5
+  workers: 8
+  seed: 0
+
+mt:
+  imgsz: [384, 640]
+  scale: s
+  loss_gains: {da: 1.0, ll: 1.0}
+  fitness: {det: 0.5, da: 0.25, ll: 0.25}   # 0.5*mAP50-95 + 0.25*DA mIoU + 0.25*lane IoU
+  head_lr_mult: 3.0
+  distill:
+    enabled: false        # true for Stage B with the DINOv3 teacher (see docs/distillation.md)
+    teacher: dinov3_b
+    teacher_scale: 1.0
+    weight: 1.0
+    weight_end: 0.1
+    every: 1

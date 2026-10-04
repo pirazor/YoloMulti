@@ -1,4 +1,4 @@
-# What the Phase 4 trainer must satisfy (from the Phase 3 review)
+# What the Phase 4 trainer must satisfy (from the Phase 3 review) - all implemented in `adas_mt/engine/train.py`
 
 Each item was reproduced by running a prototype `DetectionTrainer` subclass against Ultralytics 8.4.171 or found in
 its source. They are the contract between `adas_mt` and the trainer.
@@ -29,3 +29,14 @@ its source. They are the contract between `adas_mt` and the trainer.
     TensorRT-unverified op is `DepthToSpace(mode=CRD)` from the lane PixelShuffle: build an engine early.
     Prefer an in-graph ArgMax to uint8 for both masks, and calibrate INT8 with the deploy preprocessing (the lane
     classifier carries a +5.3 background bias).
+
+## Found while writing the trainer
+11. **`nms` default.** Ultralytics validates the NMS-free head only with `nms=False`; the default `None` validates the
+    one-to-many head with NMS. The trainer defaults `nms=False` and warns otherwise.
+12. **DDP hand-off.** `generate_ddp_command` deletes the run directory before spawning workers, so the `mt` settings are
+    handed over through a file outside it (`ADAS_MT_CFG`); workers re-write `<run>/mt.yaml` themselves.
+13. **Stripped checkpoints.** After `final_eval` the EMA weights are in `ckpt["model"]` (`"ema"` is None) and `last.pt` has
+    epoch -1: a clean stop cannot be resumed, only a crash can.
+14. **Standalone validation** wraps the model in `AutoBackend`, which exposes none of the model's attributes: the
+    validator reads class counts from the underlying model or `data.yaml`.
+15. **`pretrained=False`** discards weights even when `model` is a `.pt`; the default (`True`) keeps them.
