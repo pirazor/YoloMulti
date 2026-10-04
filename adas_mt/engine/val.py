@@ -83,8 +83,9 @@ class MultiTaskValidator(DetectionValidator):
         super().update_metrics(preds, batch)
         da_t, ll_t = unpack_masks(batch["semantic_mask"], self.da_classes, self.ll_classes)
         da, ll = self._seg
-        self.da.update(da.argmax(1), da_t)
-        self.ll.update(ll.argmax(1), ll_t)
+        # logits (B, C, H, W) from the PyTorch model, or class maps (B, H, W) from an exported graph with in-graph argmax
+        self.da.update(da if da.ndim == 3 else da.argmax(1), da_t)
+        self.ll.update(ll if ll.ndim == 3 else ll.argmax(1), ll_t)
 
     def gather_stats(self) -> None:
         super().gather_stats()

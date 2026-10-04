@@ -1,7 +1,12 @@
-# Jetson Orin Nano (aarch64). Do NOT pip-install torch / tensorrt from PyPI here:
-#  - JetPack 6.2 : use NVIDIA's JetPack-6 torch wheel; TensorRT 10.3 ships with the OS.
+# Jetson Orin Nano (aarch64). Do NOT pip-install torch / tensorrt from PyPI here.
+#  - JetPack 6.2 : NVIDIA's JetPack-6 torch wheel; TensorRT 10.3 ships with the OS.
 #  - JetPack 7.2 : torch cu132 aarch64 wheel; TensorRT 10.16 ships with the OS.
-# Inference only needs the engine + the runner; ultralytics is optional.
+#  - TensorRT 8.6 (JetPack 6.0/6.1) works too, with --seg-dtype int32 (the default).
+# Create the venv with --system-site-packages so the system `tensorrt` is importable.
+#
+# Runner / engine builder (`predict`, `bench`, `trt-build`): torch (CUDA buffers and streams), tensorrt, numpy, cv2, pyyaml.
+# Use JetPack's OpenCV (apt: python3-opencv) when you read CSI cameras through GStreamer: the pip wheels are built without it.
 numpy
-opencv-python-headless
 pyyaml
+# optional, only for `--backend ort` (development / parity): onnxruntime-gpu from NVIDIA's Jetson index, or `onnxruntime` (CPU)
+# optional, only for `python -m adas_mt eval` (it reuses the training validator): ultralytics==8.4.171

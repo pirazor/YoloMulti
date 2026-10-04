@@ -1,4 +1,4 @@
-"""``python -m adas_mt <train|val|convert|profile> ...``"""
+"""``python -m adas_mt <train|val|convert|profile|export|trt-build|predict|bench|eval> ...``"""
 
 from __future__ import annotations
 
@@ -99,6 +99,58 @@ def cmd_profile(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export(a: argparse.Namespace) -> int:
+    from adas_mt.export import export_onnx
+
+    r = export_onnx(a.weights, a.out, imgsz=a.imgsz, batch=a.batch, dynamic=a.dynamic, seg_dtype=a.seg_dtype, opset=a.opset,
+                    simplify=a.simplify, decompose_pixel_shuffle=a.decompose_pixel_shuffle, verify=a.verify,
+                    verify_image=a.verify_image)
+    print(f"{r.onnx}\n{r.meta_file}\nparity: " + ", ".join(f"{k}={v:.3g}" for k, v in r.parity.items()))
+    return 0
+
+
+def cmd_trt_build(a: argparse.Namespace) -> int:
+    from adas_mt.deploy.trt_build import build_engine, trtexec_command
+
+    keep = a.keep_fp16[0] if len(a.keep_fp16) == 1 else a.keep_fp16
+    r = build_engine(a.onnx, a.engine, a.precision, a.workspace_mb, a.calib, a.calib_n, a.calib_cache, keep, a.timing_cache,
+                     a.opt_batch, a.max_batch, a.opt_level, a.verbose)
+    print(f"{r.engine} ({r.seconds:.0f} s)\nequivalent: " + trtexec_command(a.onnx, r.engine, a.precision, a.workspace_mb))
+    return 0
+
+
+def cmd_predict(a: argparse.Namespace) -> int:
+    from adas_mt.deploy.runner import predict
+
+    stats = predict(a.model, a.source, a.out, a.conf, a.backend, a.device, a.gpu_preprocess, a.save_masks, a.show,
+                    a.max_frames, a.fps)
+    print(yaml.safe_dump(stats, sort_keys=False))
+    return 0
+
+
+def cmd_bench(a: argparse.Namespace) -> int:
+    import json
+
+    from adas_mt.deploy.runner import Pipeline, bench, format_bench, iter_frames
+
+    frame = next(iter(iter_frames(a.source)))[1] if a.source else None
+    pipe = Pipeline(a.model, a.backend, a.conf, a.device, a.gpu_preprocess)
+    r = bench(pipe, frame, a.n, a.warmup)
+    print(format_bench(r))
+    if a.json:
+        Path(a.json).write_text(json.dumps(r, indent=2), encoding="utf-8")
+    return 0
+
+
+def cmd_eval(a: argparse.Namespace) -> int:
+    from adas_mt.deploy.evaluate import evaluate
+
+    stats, speed = evaluate(a.model, a.data, a.batch, a.device, a.split, a.backend, a.conf, a.workers)
+    print(yaml.safe_dump({**{k: round(float(v), 5) for k, v in stats.items()}, **{k: round(v, 3) for k, v in speed.items()}},
+                         sort_keys=False))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="adas_mt", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -141,6 +193,74 @@ def build_parser() -> argparse.ArgumentParser:
     f.add_argument("--weights", default=None)
     f.add_argument("--imgsz", type=int, nargs=2, default=[384, 640], metavar=("H", "W"))
     f.set_defaults(func=cmd_profile)
+
+    e = sub.add_parser("export", help="checkpoint -> ONNX (fused, NMS-free, argmax in the graph) + metadata JSON")
+    e.add_argument("--weights", required=True, type=Path, help="runs/<name>/weights/best.pt (imgsz is read from the run's mt.yaml)")
+    e.add_argument("--out", type=Path, default=None, help="default: next to the weights")
+    e.add_argument("--imgsz", type=int, nargs=2, default=None, metavar=("H", "W"))
+    e.add_argument("--batch", type=int, default=1)
+    e.add_argument("--dynamic", action="store_true", help="free batch axis (engines then need an optimisation profile)")
+    e.add_argument("--seg-dtype", dest="seg_dtype", choices=["int32", "uint8", "logits"], default="int32",
+                   help="class-map dtype; uint8 needs TensorRT >= 10, logits is for debugging")
+    e.add_argument("--opset", type=int, default=17)
+    e.add_argument("--no-simplify", dest="simplify", action="store_false")
+    e.add_argument("--no-verify", dest="verify", action="store_false", help="skip the ONNX Runtime parity check")
+    e.add_argument("--verify-image", default=None, help="a real frame for the parity check (recommended for trained models)")
+    e.add_argument("--decompose-pixel-shuffle", action="store_true",
+                   help="replace DepthToSpace by Reshape/Transpose/Reshape if the engine build rejects it")
+    e.set_defaults(func=cmd_export)
+
+    b = sub.add_parser("trt-build", help="ONNX -> TensorRT engine (run ON the Jetson)")
+    b.add_argument("--onnx", required=True, type=Path)
+    b.add_argument("--engine", type=Path, default=None)
+    b.add_argument("--precision", choices=["fp32", "fp16", "int8"], default="fp16")
+    b.add_argument("--workspace-mb", type=int, default=1024)
+    b.add_argument("--calib", default=None, help="INT8: image directory or data.yaml (its train split)")
+    b.add_argument("--calib-n", type=int, default=512)
+    b.add_argument("--calib-cache", type=Path, default=None, help="reuse/write the calibration cache (delete it when the model changes)")
+    b.add_argument("--keep-fp16", nargs="+", default=["heads"], metavar="X",
+                   help="INT8: components kept in FP16: heads | seg | none, or ONNX node-name substrings")
+    b.add_argument("--timing-cache", type=Path, default=None)
+    b.add_argument("--opt-batch", type=int, default=None)
+    b.add_argument("--max-batch", type=int, default=None)
+    b.add_argument("--opt-level", type=int, default=None, help="builder optimisation level (TensorRT default 3; 5 = slowest build)")
+    b.add_argument("--verbose", action="store_true")
+    b.set_defaults(func=cmd_trt_build)
+
+    def runner_args(sp, source_required: bool) -> None:
+        sp.add_argument("--model", required=True, type=Path, help=".engine (TensorRT) or .onnx (ONNX Runtime)")
+        sp.add_argument("--source", required=source_required, default=None, help="image | directory | video | camera index | gstreamer pipeline")
+        sp.add_argument("--conf", type=float, default=0.25)
+        sp.add_argument("--backend", choices=["auto", "trt", "ort"], default="auto")
+        sp.add_argument("--device", default="cuda")
+        sp.add_argument("--gpu-preprocess", action="store_true", help="letterbox on the GPU (saves the CPU resize on a Jetson)")
+
+    r = sub.add_parser("predict", help="run an exported model on images / video / a camera and save overlays")
+    runner_args(r, True)
+    r.add_argument("--out", type=Path, default=Path("runs/predict"))
+    r.add_argument("--save-masks", action="store_true")
+    r.add_argument("--show", action="store_true")
+    r.add_argument("--max-frames", type=int, default=None)
+    r.add_argument("--fps", type=float, default=None, help="output video frame rate")
+    r.set_defaults(func=cmd_predict)
+
+    n = sub.add_parser("bench", help="end-to-end latency (pre / infer / post, p50-p99) of an exported model")
+    runner_args(n, False)
+    n.add_argument("--n", type=int, default=300)
+    n.add_argument("--warmup", type=int, default=50)
+    n.add_argument("--json", default=None, help="also write the report as JSON")
+    n.set_defaults(func=cmd_bench)
+
+    ev = sub.add_parser("eval", help="mAP / DA mIoU / lane IoU of an exported model (what export + quantisation cost)")
+    ev.add_argument("--model", required=True, type=Path)
+    ev.add_argument("--data", required=True, type=Path)
+    ev.add_argument("--split", default="val")
+    ev.add_argument("--batch", type=int, default=16)
+    ev.add_argument("--device", default="cpu")
+    ev.add_argument("--backend", choices=["auto", "trt", "ort"], default="auto")
+    ev.add_argument("--conf", type=float, default=0.001)
+    ev.add_argument("--workers", type=int, default=2)
+    ev.set_defaults(func=cmd_eval)
     return p
 
 

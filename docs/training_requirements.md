@@ -1,4 +1,5 @@
 # What the Phase 4 trainer must satisfy (from the Phase 3 review) - all implemented in `adas_mt/engine/train.py`
+# (items 27-35: found while building the Phase 5 export / deployment path)
 
 Each item was reproduced by running a prototype `DetectionTrainer` subclass against Ultralytics 8.4.171 or found in
 its source. They are the contract between `adas_mt` and the trainer.
@@ -59,3 +60,25 @@ its source. They are the contract between `adas_mt` and the trainer.
 25. **Config validation** is strict (types, positive multiples of 32, unknown `fitness`/`loss_gains` keys, `head_lr_mult > 0`, stale `ADAS_MT_CFG`,
     unknown top-level YAML sections); the effective model scale is recorded in `mt.yaml`.
 26. **Teacher safety:** `mt.distill.teacher_dtype` is configurable and a non-finite teacher output skips the step (with a warning) instead of poisoning the student.
+
+## Found while building export and deployment (Phase 5; all fixed, each with a test)
+27. **Random-init networks are degenerate in eval mode.** Activations vanish through ~100 layers, so every output is a bias and every
+    anchor ties: parity tests compared arbitrary top-k picks. Tests use `nontrivial_model()` (BatchNorm running stats calibrated in train
+    mode, raised class biases) and a spatially smooth input; a real trained model confirms it (`.pt` and ONNX metrics identical).
+28. **Top-k ties.** Detection parity compares the sorted score vector and the confident rows strictly above the top-k cutoff; row order
+    and the pick among exactly tied scores are runtime-dependent.
+29. **Rounding.** cv2 rounds half up, `torch.round` rounds half to even: the GPU letterbox differed from the validation pipeline on 12% of
+    the pixels after a 2x downscale (exact .5 averages). It now uses `floor(x + 0.5)`.
+30. **Dynamic-batch ONNX** carried stale symbolic output dims (the non-simplified graph even declared `[batch, batch, W]`); input and
+    output shapes are rewritten from the known geometry after export.
+31. **Output aliasing.** `TrtBackend.infer` returned views of its persistent output buffers; on a CPU device `.cpu().numpy()` is a no-op,
+    so the second batch overwrote the first one's results before they were concatenated (found by the fake-engine evaluation test; on CUDA the
+    D2H copy hid it). Outputs are now copied explicitly.
+32. **INT8.** A calibration cache is only reused when requested (scales are keyed by tensor names, so a stale cache silently gives a wrong
+    engine); FP16 pinning skips layers with integer outputs (TopK indices, Shape, Gather) and constants, where a float type is invalid.
+33. **TensorRT version differences** handled in the builder: `EXPLICIT_BATCH` before 10 and not after, `set_memory_pool_limit` instead of
+    `max_workspace_size`, uint8 network outputs only on TensorRT >= 10 (rejected early on 8.6).
+34. **No ultralytics/torch at import time** in `deploy.runner` / `deploy.trt_build` / `deploy.meta` (tested), so the Jetson needs only the engine,
+    the sidecar JSON and torch for CUDA buffers.
+35. **Still unverified (needs the Orin):** TensorRT acceptance of `DepthToSpace(CRD)` (`--decompose-pixel-shuffle` is the tested fallback), real
+    FP16/INT8 accuracy and latency, GStreamer camera input.
