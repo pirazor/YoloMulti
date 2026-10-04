@@ -23,14 +23,16 @@ AUX_WEIGHT = 0.4
 
 def masked_ce(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Mean CE over non-ignored pixels; exactly 0 (with a live graph) when every pixel is ignored."""
-    valid = target != IGNORE
+    # `< C` (not just `!= 255`): a class id the model has no channel for is ignored instead of being
+    # clamped onto the last class (check_matches_data makes the mismatch loud at start-up)
+    valid = target < logits.shape[1]
     n = valid.sum()
     ce = F.cross_entropy(logits, target.clamp(max=logits.shape[1] - 1), reduction="none")
     return (ce * valid).sum() / n.clamp(min=1)
 
 
 def _region_stats(logits: torch.Tensor, target: torch.Tensor):
-    valid = (target != IGNORE).unsqueeze(1)  # (N,1,H,W)
+    valid = (target < logits.shape[1]).unsqueeze(1)  # (N,1,H,W)
     probs = logits.softmax(1) * valid
     onehot = F.one_hot(target.clamp(max=logits.shape[1] - 1), logits.shape[1]).permute(0, 3, 1, 2).to(probs.dtype) * valid
     dims = (0, 2, 3)
@@ -58,7 +60,7 @@ def masked_focal_tversky(
     # d/dx x**gamma is infinite at 0 (reached when no valid pixel / perfect overlap) -> clamp, and make
     # an all-ignored batch exactly zero so it cannot produce NaN gradients.
     loss = ((1.0 - t).clamp_min(1e-6) ** gamma).mean()
-    return loss * (target != IGNORE).any()
+    return loss * (target < logits.shape[1]).any()
 
 
 class MultiTaskLoss:
@@ -70,14 +72,33 @@ class MultiTaskLoss:
         self.det = E2ELoss(model) if getattr(det, "one2one_cv2", None) is not None else v8DetectionLoss(model)
         self.device = next(model.parameters()).device
         self.da_classes, self.ll_classes = model.da_classes, model.ll_classes
-        args = getattr(model, "args", None)
-        self.w_da = float(w_da if w_da is not None else getattr(args, "da_gain", 1.0))
-        self.w_ll = float(w_ll if w_ll is not None else getattr(args, "ll_gain", 1.0))
+        args = self._args = getattr(model, "args", None)
+        # NOTE: Ultralytics' get_cfg rejects unknown keys, so gains come from the constructor / model.loss_gains
+        self.w_da = float(w_da if w_da is not None else 1.0)
+        self.w_ll = float(w_ll if w_ll is not None else 1.0)
+
+    # Ultralytics' trainer calls ``criterion.update()`` every epoch and, when resuming, sets
+    # ``criterion.updates = start_epoch - 1``; forward both to the inner E2ELoss and the distillation schedule.
+    @property
+    def updates(self) -> int:
+        return getattr(self.det, "updates", 0)
+
+    @updates.setter
+    def updates(self, value: int) -> None:
+        if hasattr(self.det, "updates"):
+            self.det.updates = value
+        self._sync_distill_progress()
+
+    def _sync_distill_progress(self) -> None:
+        if self.distiller is not None:
+            epochs = max(int(getattr(self._args, "epochs", 1)) - 1, 1)
+            self.distiller.set_progress(self.updates / epochs)
 
     def update(self) -> None:
-        """Per-epoch hook (E2ELoss decays its one-to-many weight)."""
+        """Per-epoch hook: E2ELoss decays its one-to-many weight, distillation weight follows the schedule."""
         if hasattr(self.det, "update"):
             self.det.update()
+        self._sync_distill_progress()
 
     def seg_losses(self, preds: Dict[str, torch.Tensor], batch: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         da_t, ll_t = unpack_masks(batch["semantic_mask"].to(preds["da"].device), self.da_classes, self.ll_classes)

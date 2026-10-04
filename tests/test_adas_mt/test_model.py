@@ -121,3 +121,12 @@ def test_official_checkpoint_detects_bus():
         det = m(x)["det"][0][0]
     cls = det[det[:, 4] > 0.4][:, 5].long().tolist()
     assert cls.count(0) >= 3 and 5 in cls  # persons + bus
+
+
+def test_profile_reports_the_fused_deployed_graph():
+    m = build_model("n", nc=9)
+    fused = profile_model(m, (384, 640))
+    unfused = profile_model(m, (384, 640), fused=False)
+    assert fused["det"]["gflops"] < 0.7 * unfused["det"]["gflops"]  # one-to-many branch dropped by fuse()
+    assert fused["total"]["params_M"] < unfused["total"]["params_M"]
+    assert not hasattr(m.model[-1], "_fused_marker") and m.model[-1].cv2 is not None  # input model untouched

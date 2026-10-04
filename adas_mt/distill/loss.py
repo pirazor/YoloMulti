@@ -37,7 +37,14 @@ def distill_terms(z: torch.Tensor, t: torch.Tensor, n_aff: int = 256) -> Tuple[t
     n = z.shape[1]
     idx = torch.randperm(n, device=z.device)[: min(n_aff, n)]
     zs, ts = F.normalize(z[:, idx], dim=-1), F.normalize(t[:, idx], dim=-1)
-    aff = F.mse_loss(zs @ zs.transpose(1, 2), ts @ ts.transpose(1, 2))
+    sz, st = zs @ zs.transpose(1, 2), ts @ ts.transpose(1, 2)
+    # Relational term: compare the *structure* of the token-affinity matrices. Centering removes the global
+    # offset (DINO tokens share a strong common component; the cosine term already covers it) and dividing
+    # by the teacher's centred power makes the term scale-free (~1 for an unrelated student, 0 when
+    # matched). A raw MSE would be ~0.02 (negligible); dividing the uncentred MSE by the variance explodes.
+    sz = sz - sz.mean((1, 2), keepdim=True)
+    st = st - st.mean((1, 2), keepdim=True)
+    aff = F.mse_loss(sz, st) / st.pow(2).mean().clamp_min(1e-2)  # floor: weak-structure teachers cannot blow it up
     return cos, aff
 
 
@@ -62,11 +69,16 @@ class Distiller:
         self.n_aff = n_aff_tokens
         self.progress = 0.0
         self._calls = 0
-        c3, c4 = model.da_head.lat3.conv.in_channels, model.da_head.lat4.conv.in_channels
-        device = next(model.parameters()).device
-        model.kd_proj = KDProjector(c3 + c4, teacher.dim).to(device)
         self.model = model
-        self.teacher.to(device)
+        if not hasattr(model, "kd_proj"):
+            raise RuntimeError(
+                "model has no kd_proj: build the model with kd_dim=teacher.dim (or call "
+                "model.attach_kd_projector) BEFORE creating the optimizer/EMA/DDP wrapper; a projector added "
+                "later is never optimised, never EMA'd and drifts across DDP ranks"
+            )
+        if model.kd_proj.net[-1].out_channels != teacher.dim:
+            raise ValueError("model.kd_proj width does not match the teacher")
+        self.teacher.to(next(model.parameters()).device)
 
     # lambda(t): cosine decay weight -> weight_end over training progress in [0, 1]
     def set_progress(self, p: float) -> None:
@@ -88,10 +100,13 @@ class Distiller:
     def loss_from_feats(self, p3, p4, img) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """``img``: (B,3,H,W) RGB, uint8 or float in [0,1]. Returns (weighted loss, items)."""
         self._calls += 1
-        if (self._calls - 1) % self.every:  # skipped step: no teacher forward, no gradient
-            zero = p4.sum() * 0.0
+        if (self._calls - 1) % self.every:  # skipped step: no teacher forward
+            # keep the projector in the autograd graph: DDP raises on parameters that received no gradient
+            zero = self.model.kd_proj(torch.cat([F.adaptive_avg_pool2d(p3, p4.shape[-2:]), p4], 1)).sum() * 0.0
             return zero, {"kd_loss": zero.detach(), "kd_cos": zero.detach()}
         img = img.float() / 255.0 if img.dtype == torch.uint8 else img.float()
+        if next(self.teacher.parameters()).device != img.device:  # e.g. model moved after the distiller was built
+            self.teacher.to(img.device)
         t, grid = self.teacher(img)
         z = self.student_tokens(p3, p4, grid)
         cos, aff = distill_terms(z, t, self.n_aff)

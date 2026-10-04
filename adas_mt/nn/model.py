@@ -36,12 +36,18 @@ class MultiTaskModel(DetectionModel):
         da_classes: int = 3,
         ll_classes: int = 3,
         verbose: bool = False,
+        kd_dim: int | None = None,
     ) -> None:
+        """``kd_dim``: teacher width. Pass it when training with distillation so ``kd_proj`` exists from
+        construction: the optimizer, EMA and DDP are all built from ``model.parameters()`` before the first
+        loss call (where the criterion/distiller is created), so a projector added later is silently never
+        trained, never EMA'd and not synchronised across ranks."""
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
         det = self.model[-1]
         self.p3_layer, self.p4_layer = int(det.f[0]), int(det.f[1])
         self.save = sorted(set(self.save) | {P2_LAYER})  # layer 2 is not consumed by the stock graph
         self.da_classes, self.ll_classes = int(da_classes), int(ll_classes)
+        self.loss_gains = {"da": 1.0, "ll": 1.0}  # not in model.args: Ultralytics' cfg validation rejects extra keys
         self.da_names = ["background", "direct", "alternative"][: self.da_classes]
         self.ll_names = ["background", "solid", "dashed"][: self.ll_classes]
 
@@ -54,6 +60,8 @@ class MultiTaskModel(DetectionModel):
 
         if getattr(det, "one2one_cv2", None) is not None:
             det.end2end = True  # inference uses the NMS-free one-to-one branch -> (B, 300, 6)
+        if kd_dim:
+            self.attach_kd_projector(int(kd_dim))
 
     # ------------------------------------------------------------------ graph
     def _tap_channels(self, ch: int, size: int = 128) -> tuple[int, int, int]:
@@ -111,7 +119,46 @@ class MultiTaskModel(DetectionModel):
     def init_criterion(self):  # type: ignore[override]
         from .loss import MultiTaskLoss
 
-        return MultiTaskLoss(self)
+        factory = getattr(self, "_distiller_factory", None)  # Ultralytics also calls this when resuming
+        return MultiTaskLoss(
+            self, w_da=self.loss_gains["da"], w_ll=self.loss_gains["ll"], distiller=factory(self) if factory else None
+        )
+
+    # ------------------------------------------------------------ distillation
+    def set_distiller_factory(self, factory) -> None:
+        """``factory(model) -> Distiller``; kept out of pickles/deepcopies (it references the big teacher)."""
+        self._distiller_factory = factory
+
+    def attach_kd_projector(self, dim: int):
+        """Create ``self.kd_proj`` (a normal submodule, so optimizer/EMA include it) or reuse the existing one.
+
+        Call it (or pass ``kd_dim`` to the constructor) BEFORE the optimizer, EMA and DDP wrapper are built.
+        If a checkpoint loaded by :meth:`load` carried a Stage-A projector for the same teacher width,
+        its weights are restored; otherwise it starts fresh."""
+        from adas_mt.distill.loss import KDProjector
+
+        c_in = self.da_head.lat3.conv.in_channels + self.da_head.lat4.conv.in_channels
+        if not hasattr(self, "kd_proj"):
+            self.kd_proj = KDProjector(c_in, dim).to(next(self.parameters()).device)
+            self._restore_kd(getattr(self, "_kd_state", None))
+        assert self.kd_proj.net[-1].out_channels == dim, "kd_proj width does not match the teacher"
+        return self.kd_proj
+
+    def _restore_kd(self, kd) -> None:
+        if kd is None or not hasattr(self, "kd_proj"):
+            return
+        dim = self.kd_proj.net[-1].out_channels
+        if kd["dim"] == dim:
+            self.kd_proj.load_state_dict(kd["state"])
+            LOGGER.info("restored Stage-A distillation projector")
+        else:
+            LOGGER.warning(f"Stage-A projector is for teacher dim {kd['dim']}, not {dim}: starting fresh")
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for k in ("_distiller_factory", "_kd_state", "criterion"):  # never pickle/deepcopy the teacher
+            state.pop(k, None)
+        return state
 
     # ------------------------------------------------------------------- fuse
     def fuse(self, verbose: bool = True):  # type: ignore[override]
@@ -150,6 +197,9 @@ class MultiTaskModel(DetectionModel):
                 f"({self.yaml.get('scale')!r})."
             )
         self.load_state_dict(matched, strict=False)
+        if isinstance(weights, dict) and weights.get("kd_proj") is not None:
+            self._kd_state = {"state": weights["kd_proj"], "dim": int(weights["kd_dim"])}
+            self._restore_kd(self._kd_state)  # kd_proj already exists when the model was built with kd_dim
         if verbose:
             LOGGER.info(f"Transferred {len(matched)}/{len(own)} tensors; backbone+neck {ratio:.1%} (heads init fresh)")
         self.transfer_ratio = ratio
@@ -169,6 +219,7 @@ def build_model(
     ll_classes: int = 3,
     weights: str | Path | None = None,
     verbose: bool = False,
+    kd_dim: int | None = None,
 ) -> MultiTaskModel:
     """Build ``yolo26{scale}``-based multi-task model, optionally from a pretrained YOLO26 checkpoint."""
     ckpt = None
@@ -177,7 +228,17 @@ def build_model(
         got = _ckpt_scale(ckpt)
         if got and got != scale:
             raise ValueError(f"checkpoint {weights} is scale {got!r} but scale {scale!r} was requested")
-    model = MultiTaskModel(f"yolo26{scale}.yaml", nc=nc, da_classes=da_classes, ll_classes=ll_classes, verbose=verbose)
+    model = MultiTaskModel(
+        f"yolo26{scale}.yaml", nc=nc, da_classes=da_classes, ll_classes=ll_classes, verbose=verbose, kd_dim=kd_dim
+    )
     if ckpt is not None:
         model.load(ckpt)
     return model
+
+
+def check_matches_data(model: MultiTaskModel, data: dict) -> None:
+    """The packed mask is decoded with the MODEL's class counts, so a mismatch with ``data.yaml`` would
+    silently scramble or mislabel targets. Trainers must call this once."""
+    for key, have in (("nc", model.model[-1].nc), ("da_classes", model.da_classes), ("ll_classes", model.ll_classes)):
+        if int(data[key]) != int(have):
+            raise ValueError(f"data.yaml {key}={data[key]} but the model was built with {have}")

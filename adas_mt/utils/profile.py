@@ -7,6 +7,7 @@ GFLOPs = 2 x MACs counted by ``torch.utils.flop_counter`` (convs / matmuls; elem
 from __future__ import annotations
 
 import time
+from copy import deepcopy
 from typing import Dict, Sequence
 
 import torch
@@ -20,9 +21,16 @@ def _gflops(fn) -> float:
 
 
 @torch.no_grad()
-def profile_model(model, imgsz: Sequence[int] = (384, 640), latency_runs: int = 0) -> Dict[str, Dict[str, float]]:
-    """Return ``{component: {params_M, gflops}}`` plus ``total`` (and CPU latency if requested)."""
-    model = model.eval().float()
+def profile_model(
+    model, imgsz: Sequence[int] = (384, 640), latency_runs: int = 0, fused: bool = True
+) -> Dict[str, Dict[str, float]]:
+    """Return ``{component: {params_M, gflops}}`` plus ``total`` (and CPU latency if requested).
+
+    ``fused=True`` profiles a fused copy, i.e. what is deployed: ``fuse()`` folds Conv+BN and drops the
+    one-to-many detection branch (~7% of the FLOPs of the training graph)."""
+    model = deepcopy(model).eval().float()
+    if fused:
+        model.fuse(verbose=False)
     x = torch.zeros(1, 3, *imgsz)
     backbone_end = int(model.yaml["backbone"].__len__())  # layers [0, backbone_end) are the backbone
     layers = list(model.model)

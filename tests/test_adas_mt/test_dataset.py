@@ -112,3 +112,20 @@ def test_collate_and_workers(synth_root, synth_data):
     assert b["semantic_mask"].shape == (4, *HW) and b["semantic_mask"].dtype == torch.int32
     assert b["bboxes"].shape[1] == 4 and b["batch_idx"].shape[0] == b["bboxes"].shape[0] == b["cls"].shape[0]
     assert b["bboxes"].min() >= 0 and b["bboxes"].max() <= 1
+
+
+def test_rect_dataset_is_rejected(synth_root, synth_data):
+    """DetectionTrainer.build_dataset passes rect=True for val -> 384x672 images instead of the deployed 384x640."""
+    with pytest.raises(ValueError, match="rect"):
+        MultiTaskDataset(img_path=str(synth_root / "images" / "val"), data=synth_data, imgsz=HW, augment=False,
+                         hyp=make_hyp(), batch_size=4, rect=True, prefix="")
+
+
+def test_corrupt_mask_fails_loudly(tmp_path, synth_data):
+    from .conftest import make_split
+
+    make_split(tmp_path, "train", 2)
+    (tmp_path / "labels_ll" / "train" / "train_000.png").write_bytes(b"not a png")
+    ds = build(tmp_path, dict(synth_data, path=str(tmp_path)), augment=False)
+    with pytest.raises(OSError, match="corrupt mask"):
+        ds[0]

@@ -5,7 +5,7 @@ YOLO26-based CNN, trained with dense foundation-model distillation (training-tim
 only) and deployed as a TensorRT FP16/INT8 engine with NMS-free detection and
 uint8 class-map outputs.
 
-Status: **v0.2 rewrite in progress**: Phase 0 (re-platform), Phase 1 ([data](docs/data.md)) and Phase 2 ([model](docs/architecture.md)) and Phase 3 ([distillation](docs/distillation.md)) done.
+Status: **v0.2 rewrite in progress**: Phase 0 (re-platform), Phase 1 ([data](docs/data.md)) and Phase 2 ([model](docs/architecture.md)) and Phase 3 ([distillation](docs/distillation.md)) done; see [docs/training_requirements.md](docs/training_requirements.md) for the trainer contract.
 The previous YOLOv13-based implementation lives in [`legacy/yolov13/`](legacy/yolov13/)
 (tag `yolov13-mt-baseline`) and is kept as the A0 baseline for ablations.
 

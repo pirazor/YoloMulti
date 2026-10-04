@@ -1,11 +1,9 @@
-"""Frozen vision-foundation-model teacher (DINOv3 / DINOv2 via timm) for training-time distillation.
+"""Frozen DINOv3 teacher (via timm) for training-time feature distillation.
 
-The teacher never ships: it only produces dense patch-token targets for the student's neck features.
-Weights are fetched by timm (``pretrained=True``) or loaded from a local ``checkpoint``.
-
-Cost at 384x640 (forward only, GFLOPs): ViT-S/16 42, ViT-S+/16 55, ViT-B/16 165. The student (YOLO26s)
-needs ~42 for forward+backward, so ViT-B/16 makes training ~5x more expensive; use ``dinov3_s_plus``
-(default) or lower ``input_scale``.
+The teacher runs on the training GPU only and never ships: it produces dense patch-token targets for the
+student's neck features. Weights are fetched by timm (``pretrained=True``) or loaded from a local
+``checkpoint``. Forward cost at 384x640 (GFLOPs): ViT-S 42, S+ 55, B 165, L 584, H+ 1621 (the YOLO26s
+training step is ~54), so ViT-B is a balanced default and ViT-L the high-quality option on a big cloud GPU.
 """
 
 from __future__ import annotations
@@ -20,11 +18,12 @@ import torch.nn.functional as F
 
 ALIASES = {
     "dinov3_s": "vit_small_patch16_dinov3.lvd1689m",
-    "dinov3_s_plus": "vit_small_plus_patch16_dinov3.lvd1689m",  # default: best dense quality per FLOP
-    "dinov3_b": "vit_base_patch16_dinov3.lvd1689m",
-    "dinov2_s": "vit_small_patch14_dinov2.lvd142m",  # Apache-2.0 alternative
-    "dinov2_b": "vit_base_patch14_dinov2.lvd142m",
+    "dinov3_s_plus": "vit_small_plus_patch16_dinov3.lvd1689m",
+    "dinov3_b": "vit_base_patch16_dinov3.lvd1689m",  # default
+    "dinov3_l": "vit_large_patch16_dinov3.lvd1689m",
+    "dinov3_h_plus": "vit_huge_plus_patch16_dinov3.lvd1689m",
 }
+DEFAULT_TEACHER = "dinov3_b"
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
@@ -34,7 +33,7 @@ class FrozenTeacher(nn.Module):
 
     def __init__(
         self,
-        name: str = "dinov3_s_plus",
+        name: str = DEFAULT_TEACHER,
         pretrained: bool = True,
         checkpoint: str | Path | None = None,
         input_scale: float = 1.0,
@@ -79,7 +78,8 @@ class FrozenTeacher(nn.Module):
     def _autocast(self, device_type: str):
         if device_type != "cuda" or self.dtype == "float32":
             return torch.autocast(device_type, enabled=False)
-        dt = torch.bfloat16 if (self.dtype == "auto" and torch.cuda.is_bf16_supported()) else torch.float16
+        # including_emulation=False: T4/V100 "support" bf16 only through slow emulation
+        dt = torch.bfloat16 if (self.dtype == "auto" and torch.cuda.is_bf16_supported(including_emulation=False)) else torch.float16
         if self.dtype == "bfloat16":
             dt = torch.bfloat16
         return torch.autocast("cuda", dtype=dt)

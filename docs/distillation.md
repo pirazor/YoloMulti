@@ -1,49 +1,70 @@
 # Foundation-model distillation (Phase 3)
 
-A frozen DINOv3 / DINOv2 ViT (via `timm`) supplies dense patch-token targets for the YOLO neck during
-training. The teacher is **not** part of the deployed model; `strip_training_only()` removes the
-projector (`model.kd_proj`) and the DA auxiliary classifier before export.
+A frozen **DINOv3** ViT (via `timm`) supplies dense patch-token targets for the YOLO neck during training.
+The teacher runs on the cloud training GPU only. It is not part of the deployed model:
+`strip_training_only()` removes the projector (`model.kd_proj`) and the DA auxiliary classifier before export,
+so the Jetson Orin Nano Super engine contains only the YOLO26 CNN and the two light heads.
 
 ```
 image ─► YOLO26 backbone+neck ─► P3 (avg-pooled to s16) ⊕ P4 ─► projector (1x1-BN-SiLU-1x1) ─► (B,N,D) ─┐
-   └───► frozen ViT teacher (no grad) ───────────────────────────────────────────────► (B,N,D) ◄───────┘
-                                  loss = lambda(t) * [ cosine distance + token-affinity MSE ]
+   └───► frozen DINOv3 ViT (no grad, bf16) ──────────────────────────────────────────────► (B,N,D) ◄────┘
+        loss = lambda(t) * [ cosine distance + relational (centred, scale-free) token-affinity term ]
 ```
-`lambda(t)` decays from `weight` to `weight_end` by cosine over training (`Distiller.set_progress(p)`).
-If the teacher grid differs from the student's stride-16 grid (patch 14, or `input_scale` != 1) the
-projected student map is resized to the teacher grid.
+`lambda(t)` decays from `weight` to `weight_end` (default 1.0 -> 0.1) by cosine over training. It is driven by the
+criterion itself (`MultiTaskLoss.update()` once per epoch, `criterion.updates = k` on resume), so the trainer needs no
+special coupling. If the teacher grid differs from the student's stride-16 grid (`input_scale` != 1) the projected
+student map is resized to the teacher grid.
 
-## Choosing the teacher (measured at 384x640; student = YOLO26s train step 53.6 GFLOPs fwd+bwd)
-| teacher (`--teacher`) | `input_scale` | teacher GFLOPs | training step cost |
-|---|---|---|---|
-| `dinov3_s` (ViT-S/16) | 1.0 / 0.5 | 41.5 / 10.5 | x1.78 / x1.20 |
-| **`dinov3_s_plus`** (default) | 1.0 / 0.5 | 55.2 / 14.0 | **x2.03** / x1.26 |
-| `dinov3_b` (ViT-B/16) | 1.0 / 0.5 | 165.1 / 41.9 | x4.08 / x1.78 |
-| `dinov2_s` / `dinov2_b` | patch 14 | similar | Apache-2.0 alternative |
+## Choosing the teacher (`--teacher`)
+Forward cost at 384x640 (the YOLO26s training step is ~54 GFLOPs fwd+bwd):
 
-FLOP ratios, not wall time (ViT matmuls run more efficiently on a GPU than YOLO convs, so the real
-overhead is usually lower). `--every k` distils every k-th step to cut it further.
-**Licence:** DINOv3 weights use Meta's DINOv3 licence (commercial use allowed, with restrictions): get a legal review
-before using it for a product. DINOv2 is Apache-2.0.
+| `--teacher` | timm model | params | teacher GFLOPs | ViT dim |
+|---|---|---|---|---|
+| `dinov3_s` | vit_small_patch16_dinov3 | 22M | 42 | 384 |
+| `dinov3_s_plus` | vit_small_plus_patch16_dinov3 | 29M | 55 | 384 |
+| **`dinov3_b`** (default) | vit_base_patch16_dinov3 | 86M | 165 | 768 |
+| `dinov3_l` | vit_large_patch16_dinov3 | 303M | 584 | 1024 |
+| `dinov3_h_plus` | vit_huge_plus_patch16_dinov3 | 841M | 1621 | 1280 |
+
+Because the teacher costs cloud GPU time, not Jetson time, a larger teacher is allowed; quality gains with size
+are not guaranteed for a 10M-parameter student (capacity gap), so compare `dinov3_b` vs `dinov3_l` in the ablation.
+Teacher runs in bf16 autocast on CUDA (`dtype="auto"`); `--every k` distils every k-th step; `--teacher_scale 0.5` runs
+the teacher at half resolution (4x cheaper, coarser targets).
+Use `--teacher_ckpt /path/teacher.safetensors` when the machine cannot reach the Hugging Face hub.
+`--teacher_scale` / `dtype="auto"` pick bf16 only on GPUs with native bf16 (A100/H100/L4), fp16 otherwise.
 
 ## Stage A: distillation-only pretraining on unlabelled frames
 ```bash
 python -m adas_mt.distill.pretrain --images /data/all_frames --scale s --weights yolo26s.pt \
-    --teacher dinov3_s_plus --epochs 20 --batch 32 --imgsz 384 640
-# -> runs/distill/exp/last.pt  (backbone+neck distilled, projector/aux stripped)
+    --teacher dinov3_b --epochs 20 --batch 32 --imgsz 384 640
+# -> runs/distill/exp/last.pt: backbone+neck distilled; the trained projector is saved under "kd_proj"
 ```
-Stage B (multi-task training, Phase 4) starts from it: `build_model("s", nc=9, weights="runs/distill/exp/last.pt")`.
-Use `--teacher_ckpt /path/teacher.safetensors` when the machine cannot reach the Hugging Face hub.
+`--images` may be a converted dataset root: only `images/train` is used (never mask PNGs or val frames).
+Backbone+neck train at `lr * student_lr_mult` (default 0.2) and the projector at `lr`: a pure distillation loss with no
+detection anchor could otherwise erode the pretrained detection features (an unverified default; the A3 ablation
+decides). Stage B (multi-task training) starts from it: `build_model("s", nc=9, weights="runs/distill/exp/last.pt")`.
+The Stage-A projector is restored when Stage B enables distillation with the same teacher width; with a different
+teacher it starts fresh (warned). Starting Stage B with a *fresh* projector would pull the neck away from the Stage-A
+alignment at full distillation weight, which is why the projector travels with the checkpoint.
 
-## In the joint loss
-`MultiTaskLoss(model, distiller=Distiller(model, teacher))` appends a sixth loss element (`kd_loss`,
-plus `kd_cos` = mean cosine similarity as a monitor). `model.kd_proj` is an ordinary submodule, so the
-trainer's optimizer and EMA pick it up with no special casing.
+## Wiring it into a trainer (Phase 4 does this)
+```python
+model = build_model("s", nc=9, weights=..., kd_dim=teacher.dim)          # kd_proj exists from construction
+model.set_distiller_factory(lambda m: Distiller(m, teacher))            # teacher is built/moved lazily
+```
+**Order matters.** The optimizer, EMA and the DDP wrapper are built from `model.parameters()` *before* the first loss
+call, which is where the criterion (and so the `Distiller`) is created. A projector registered at that point is in no
+optimizer (never trained), not in the EMA or `last.pt` (NaN-recovery `load_state_dict` then fails on missing keys),
+and is not synchronised across DDP ranks. Hence `kd_dim` at model construction, and `Distiller(...)` raises if
+`model.kd_proj` is missing.
+
+`MultiTaskModel.init_criterion()` builds `MultiTaskLoss(model, distiller=factory(model))`, which is also what
+Ultralytics calls when resuming, so distillation survives a resume. The factory, the criterion and the teacher are
+excluded from pickles/deepcopies (`__getstate__`), so checkpoints and the EMA never carry the teacher. On skipped
+(`every>1`) steps the projector is still run, which keeps DDP safe even with `find_unused_parameters=False`.
 
 ## Tests
-`tests/test_adas_mt/test_distill.py` uses randomly initialised ViTs (including the real DINOv3 and
-DINOv2 architectures, to check the token grid with RoPE / register tokens / patch 14), because the
-pretrained weights cannot be downloaded in CI. They check: frozen teacher and unchanged weights after
-an optimizer step, gradients into backbone/neck/projector, `every=k`, schedule, strip-for-export keeps
-inference identical, and that Stage A raises student-teacher cosine similarity and writes a checkpoint that
-`build_model(weights=...)` reloads.
+`tests/test_adas_mt/test_distill.py` uses randomly initialised ViTs (including the real DINOv3 architecture at
+384x640, to check the token grid with RoPE and register tokens), because pretrained weights cannot be downloaded in CI. It checks the
+frozen teacher, gradients, schedule, resume (distiller + `E2ELoss` counter), DDP-safe skipped steps, strip-for-export
+parity, scale-free affinity term, and that Stage A improves alignment and its checkpoint (incl. projector) reloads.

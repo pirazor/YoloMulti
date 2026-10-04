@@ -5,7 +5,7 @@ features; Stage B (normal multi-task training) then starts from this checkpoint 
 ``build_model(scale, weights=<last.pt>)``.
 
     python -m adas_mt.distill.pretrain --images /data/frames --scale s --weights yolo26s.pt \
-        --teacher dinov3_s_plus --epochs 20 --batch 32 --imgsz 384 640
+        --teacher dinov3_b --epochs 20 --batch 32 --imgsz 384 640
 """
 
 from __future__ import annotations
@@ -24,16 +24,28 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from adas_mt.distill.loss import Distiller
-from adas_mt.distill.teacher import FrozenTeacher
+from adas_mt.distill.teacher import ALIASES, DEFAULT_TEACHER, FrozenTeacher
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def find_images(root: str | Path) -> list:
+    """Frames to distil on. Pointed at a converted dataset root this must NOT pick up the ``labels_da`` /
+    ``labels_ll`` mask PNGs or the validation frames, so use ``images/train`` when it exists."""
+    root = Path(root)
+    if (root / "images" / "train").is_dir():
+        root = root / "images" / "train"
+    return sorted(
+        p for p in root.rglob("*")
+        if p.suffix.lower() in IMG_EXT and not any(part.startswith(("labels", "masks")) for part in p.relative_to(root).parts)
+    )
 
 
 class UnlabeledImages(Dataset):
     """Images -> random (h, w) views: scale jitter, random placement, flip, brightness/contrast. uint8 RGB CHW."""
 
     def __init__(self, root: str | Path, hw: Sequence[int] = (384, 640), augment: bool = True):
-        self.files = sorted(p for p in Path(root).rglob("*") if p.suffix.lower() in IMG_EXT)
+        self.files = find_images(root)
         if not self.files:
             raise FileNotFoundError(f"no images under {root}")
         self.hw, self.augment = (int(hw[0]), int(hw[1])), augment
@@ -73,6 +85,7 @@ def pretrain(
     epochs: int = 20,
     batch: int = 16,
     lr: float = 1e-3,
+    student_lr_mult: float = 0.2,
     weight_decay: float = 0.01,
     workers: int = 4,
     device: str | torch.device | None = None,
@@ -89,16 +102,25 @@ def pretrain(
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     model.to(device).train()
+    model.attach_kd_projector(teacher.dim)  # before the optimizer is built
     distiller = Distiller(model, teacher, w_cos=w_cos, w_aff=w_aff, weight=1.0, weight_end=1.0, every=every)
 
     ds = UnlabeledImages(images, imgsz, augment=True)
     dl = DataLoader(ds, batch_size=batch, shuffle=True, num_workers=workers, drop_last=len(ds) >= batch,
                     pin_memory=device.type == "cuda", persistent_workers=workers > 0)
-    params = [p for n, p in model.named_parameters() if p.requires_grad and (n.startswith("model.") or n.startswith("kd_proj"))
-              and not n.startswith(f"model.{len(model.model) - 1}.")]  # backbone + neck + projector only
-    decay = [p for p in params if p.ndim > 1]
-    no_decay = [p for p in params if p.ndim <= 1]
-    opt = torch.optim.AdamW([{"params": decay, "weight_decay": weight_decay}, {"params": no_decay, "weight_decay": 0.0}], lr=lr)
+    # Backbone + neck at a reduced LR (pretrained detection features should not be eroded by a pure
+    # distillation loss with no detection anchor), the freshly initialised projector at the full LR.
+    last_layer = f"model.{len(model.model) - 1}."
+    student = [(n, p) for n, p in model.named_parameters() if n.startswith("model.") and not n.startswith(last_layer)]
+    proj = [(n, p) for n, p in model.named_parameters() if n.startswith("kd_proj")]
+    groups = []
+    for named, mult in ((student, student_lr_mult), (proj, 1.0)):
+        groups += [
+            {"params": [p for _, p in named if p.ndim > 1], "weight_decay": weight_decay, "lr": lr * mult},
+            {"params": [p for _, p in named if p.ndim <= 1], "weight_decay": 0.0, "lr": lr * mult},
+        ]
+    params = [p for g in groups for p in g["params"]]
+    opt = torch.optim.AdamW(groups, lr=lr)
     total = epochs * len(dl)
     warm = min(100, max(1, total // 10))
     sched = torch.optim.lr_scheduler.LambdaLR(
@@ -125,7 +147,12 @@ def pretrain(
             n += 1
         log(f"epoch {ep + 1}/{epochs}  kd_loss {run_loss / max(n, 1):.4f}  cos_sim {run_cos / max(n, 1):.4f}  {time.time() - t0:.0f}s")
         export = deepcopy(model).cpu().float().strip_training_only()  # clean checkpoint: no projector, no aux
-        torch.save({"model": export, "epoch": ep, "kd_cos": run_cos / max(n, 1), "teacher": teacher.name}, last)
+        torch.save(
+            {"model": export, "epoch": ep, "kd_cos": run_cos / max(n, 1), "teacher": teacher.name,
+             # the projector is trained together with the student: Stage B must start from it, not from scratch
+             "kd_proj": {k: v.detach().cpu() for k, v in model.kd_proj.state_dict().items()}, "kd_dim": teacher.dim},
+            last,
+        )
     return last
 
 
@@ -137,13 +164,14 @@ def main(argv=None) -> int:
     ap.add_argument("--scale", default="s", choices=list("nsmlx"))
     ap.add_argument("--weights", default=None, help="pretrained YOLO26 checkpoint to start from")
     ap.add_argument("--nc", type=int, default=9)
-    ap.add_argument("--teacher", default="dinov3_s_plus")
+    ap.add_argument("--teacher", default=DEFAULT_TEACHER, choices=sorted(ALIASES))
     ap.add_argument("--teacher_ckpt", default=None, help="local teacher weights (.pth/.safetensors) instead of timm download")
     ap.add_argument("--teacher_scale", type=float, default=1.0, help="teacher input scale (0.5 = 4x cheaper, coarser targets)")
     ap.add_argument("--imgsz", type=int, nargs=2, default=[384, 640], metavar=("H", "W"))
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=1e-3, help="projector LR; backbone+neck use lr * --student_lr_mult")
+    ap.add_argument("--student_lr_mult", type=float, default=0.2)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--every", type=int, default=1, help="distil every k-th step (teacher is the cost)")
     ap.add_argument("--device", default=None)
@@ -154,7 +182,8 @@ def main(argv=None) -> int:
 
     model = build_model(a.scale, nc=a.nc, weights=a.weights)
     teacher = FrozenTeacher(a.teacher, pretrained=a.teacher_ckpt is None, checkpoint=a.teacher_ckpt, input_scale=a.teacher_scale)
-    pretrain(model, teacher, a.images, a.imgsz, a.epochs, a.batch, a.lr, a.workers, a.device, a.save_dir, every=a.every)
+    pretrain(model, teacher, a.images, a.imgsz, a.epochs, a.batch, a.lr, a.student_lr_mult, workers=a.workers,
+             device=a.device, save_dir=a.save_dir, every=a.every)
     return 0
 
 

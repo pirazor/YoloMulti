@@ -24,8 +24,8 @@ def tiny_teacher():
 @pytest.mark.parametrize(
     "name,scale,hw,grid",
     [(TINY, 1.0, (96, 160), (6, 10)), (TINY, 0.5, (96, 160), (3, 5)),
-     ("vit_small_patch14_dinov2", 1.0, (112, 168), (8, 12)),
-     ("vit_small_patch16_dinov3", 1.0, (96, 160), (6, 10))],  # real DINOv3 arch (RoPE, register tokens)
+     ("vit_small_patch16_dinov3", 1.0, (96, 160), (6, 10)),  # real DINOv3 arch (RoPE, register tokens)
+     ("vit_small_patch16_dinov3", 0.5, (384, 640), (12, 20))],  # production resolution, half-res teacher
 )
 def test_teacher_token_grid(name, scale, hw, grid):
     t = FrozenTeacher(name, pretrained=False, input_scale=scale)
@@ -41,16 +41,21 @@ def test_teacher_is_frozen_and_deterministic(tiny_teacher):
     assert torch.equal(tiny_teacher(x)[0], tiny_teacher(x)[0])
 
 
-def test_distill_terms_extremes():
-    t = torch.randn(2, 40, 16)
+def test_distill_terms_extremes_and_scale():
+    torch.manual_seed(0)
+    t = torch.randn(2, 40, 16) + 2.0 * torch.randn(2, 1, 16)  # correlated tokens, like real dense features
     cos, aff = distill_terms(t, t)
     assert cos.abs() < 1e-5 and aff.abs() < 1e-6
     cos, _ = distill_terms(-t, t)
     assert abs(cos.item() - 2.0) < 1e-5
+    # the affinity term must be O(1) for an unrelated student (a raw MSE of cosines is ~0.02 and would vanish)
+    _, aff_rand = distill_terms(torch.randn_like(t), t)
+    _, aff_close = distill_terms(t + 0.1 * torch.randn_like(t), t)
+    assert 0.3 < aff_rand.item() < 10 and aff_close.item() < 0.1 * aff_rand.item()
 
 
 def test_lambda_schedule(tiny_teacher):
-    m = build_model("n", nc=2)
+    m = build_model("n", nc=2, kd_dim=tiny_teacher.dim)
     d = Distiller(m, tiny_teacher, weight=1.0, weight_end=0.1)
     d.set_progress(0.0)
     assert math.isclose(d.lam, 1.0)
@@ -61,7 +66,7 @@ def test_lambda_schedule(tiny_teacher):
 
 
 def test_gradients_reach_student_not_teacher(tiny_teacher):
-    m = build_model("n", nc=2).train()
+    m = build_model("n", nc=2, kd_dim=tiny_teacher.dim).train()
     d = Distiller(m, tiny_teacher)
     before = {k: v.clone() for k, v in tiny_teacher.state_dict().items()}
     x = torch.rand(2, 3, 128, 224)
@@ -77,7 +82,7 @@ def test_gradients_reach_student_not_teacher(tiny_teacher):
 
 
 def test_every_k_skips_teacher(tiny_teacher):
-    m = build_model("n", nc=2).train()
+    m = build_model("n", nc=2, kd_dim=tiny_teacher.dim).train()
     d = Distiller(m, tiny_teacher, every=3)
     calls = []
     orig = d.teacher.forward
@@ -89,8 +94,39 @@ def test_every_k_skips_teacher(tiny_teacher):
     assert len(calls) == 2 and [v != 0.0 for v in vals] == [True, False, False, True, False, False]
 
 
+def test_skipped_steps_keep_projector_in_graph(tiny_teacher):
+    """DDP raises on parameters that get no gradient; a skipped (every>1) step must still touch kd_proj."""
+    m = build_model("n", nc=2, kd_dim=tiny_teacher.dim)
+    m.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=10)
+    m.train()
+    crit = MultiTaskLoss(m, distiller=Distiller(m, tiny_teacher, every=2))
+    b = _batch()
+    for step in range(2):
+        m.zero_grad(set_to_none=True)
+        loss, _ = crit(m(b["img"]), b)
+        loss.sum().backward()
+        assert [n for n, p in m.named_parameters() if p.requires_grad and p.grad is None] == [], f"step {step}"
+
+
+def test_resume_restores_distiller_and_schedule(tiny_teacher):
+    """Ultralytics resume does: criterion = model.init_criterion(); criterion.updates = k; criterion.update()."""
+    import copy
+
+    m = build_model("n", nc=2, kd_dim=tiny_teacher.dim)
+    m.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=10)
+    m.set_distiller_factory(lambda mm: Distiller(mm, tiny_teacher, weight=1.0, weight_end=0.1))
+    crit = m.init_criterion()
+    assert crit.distiller is not None
+    crit.updates = 4
+    crit.update()
+    assert crit.det.updates == 5  # inner E2ELoss schedule restored, not reset to 1
+    assert math.isclose(crit.distiller.progress, 5 / 9)
+    clone = copy.deepcopy(m)  # EMA / checkpoints must never drag the teacher along
+    assert not hasattr(clone, "_distiller_factory") and not hasattr(clone, "criterion")
+
+
 def test_integrates_with_multitask_loss(tiny_teacher):
-    m = build_model("n", nc=2)
+    m = build_model("n", nc=2, kd_dim=tiny_teacher.dim)
     m.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=10)
     m.train()
     crit = MultiTaskLoss(m, distiller=Distiller(m, tiny_teacher))
@@ -103,7 +139,7 @@ def test_integrates_with_multitask_loss(tiny_teacher):
 
 
 def test_strip_training_only_keeps_inference_identical(tiny_teacher):
-    m = build_model("n", nc=2)
+    m = build_model("n", nc=2, kd_dim=tiny_teacher.dim)
     Distiller(m, tiny_teacher)
     m.eval()
     x = torch.rand(1, 3, 96, 160)
@@ -134,3 +170,39 @@ def test_stage_a_pretrain_improves_alignment_and_checkpoint_loads(tmp_path, synt
     reloaded = build_model("n", nc=2, weights=last)  # Stage B starts from this checkpoint
     assert reloaded.transfer_ratio > 0.99
     assert not any(k.startswith("kd_proj") for k in ck["model"].state_dict())
+    # ... and from the trained projector, not a fresh one (a fresh one would undo the Stage-A alignment)
+    proj = reloaded.attach_kd_projector(tiny_teacher.dim)
+    assert all(torch.equal(proj.state_dict()[k], v) for k, v in ck["kd_proj"].items())
+    other = build_model("n", nc=2, weights=last).attach_kd_projector(128)  # different teacher width -> fresh
+    assert other.net[-1].out_channels == 128
+
+
+def test_projector_exists_before_optimizer_and_ema(tiny_teacher):
+    """The trap: a kd_proj created lazily at the first loss call is in no optimizer, EMA or DDP wrapper."""
+    from ultralytics.utils.torch_utils import ModelEMA
+
+    m = build_model("n", nc=2, kd_dim=tiny_teacher.dim)
+    names = {n for n, _ in m.named_parameters()}
+    assert any(n.startswith("kd_proj") for n in names)
+    assert any(k.startswith("kd_proj") for k in ModelEMA(m).ema.state_dict())
+    late = build_model("n", nc=2)  # no kd_dim -> must fail loudly instead of registering a projector too late
+    with pytest.raises(RuntimeError, match="kd_proj"):
+        Distiller(late, tiny_teacher)
+
+
+def test_stage_a_projector_restored_at_construction(tmp_path, synth_root, tiny_teacher):
+    from adas_mt.distill.pretrain import pretrain
+
+    last = pretrain(build_model("n", nc=2), tiny_teacher, synth_root / "images" / "train", (96, 160), epochs=1,
+                    batch=4, workers=0, device="cpu", save_dir=tmp_path, amp=False, log=lambda *_: None)
+    ck = torch.load(last, weights_only=False)
+    b = build_model("n", nc=2, weights=last, kd_dim=tiny_teacher.dim)  # trainer path: kd_proj built, then restored
+    assert all(torch.equal(b.kd_proj.state_dict()[k], v) for k, v in ck["kd_proj"].items())
+
+
+def test_stage_a_image_discovery_skips_masks_and_val(synth_root):
+    from adas_mt.distill.pretrain import find_images
+
+    found = find_images(synth_root)  # a converted dataset ROOT: only images/train may be used
+    assert found and all("images/train" in str(p) for p in found) and not any(".png" in p.suffix for p in found)
+    assert len(find_images(synth_root / "images" / "train")) == len(found)

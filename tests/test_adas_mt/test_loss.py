@@ -101,3 +101,29 @@ def test_overfits_a_tiny_batch():
     assert last["total"] < 0.6 * first["total"], (first, last)
     assert last["da_loss"] < 0.6 * first["da_loss"], (first, last)
     assert last["ll_loss"] < 0.8 * first["ll_loss"], (first, last)
+
+
+def test_class_id_without_a_channel_is_ignored_not_clamped():
+    """Previously target 5 with C=3 was clamped onto class 2 and trained as 'dashed'."""
+    torch.manual_seed(0)
+    logits = torch.randn(2, 3, 12, 12)
+    target = torch.randint(0, 3, (2, 12, 12))
+    bad = target.clone()
+    bad[:, :, 6:] = 5  # ids the model has no channel for
+    ignored = target.clone()
+    ignored[:, :, 6:] = IGNORE
+    for fn in (masked_ce, masked_dice, masked_focal_tversky):
+        assert torch.allclose(fn(logits, bad), fn(logits, ignored)), fn.__name__
+
+
+def test_check_matches_data_and_loss_gains():
+    from adas_mt.nn.model import check_matches_data
+
+    m = build_model("n", nc=2)
+    check_matches_data(m, {"nc": 2, "da_classes": 3, "ll_classes": 3})
+    with pytest.raises(ValueError, match="ll_classes"):
+        check_matches_data(m, {"nc": 2, "da_classes": 3, "ll_classes": 5})
+    m.args = SimpleNamespace(box=7.5, cls=0.5, dfl=1.5, epochs=10)
+    m.loss_gains = {"da": 2.0, "ll": 0.5}
+    crit = m.init_criterion()
+    assert (crit.w_da, crit.w_ll) == (2.0, 0.5)
