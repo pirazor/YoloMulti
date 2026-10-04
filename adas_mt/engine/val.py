@@ -17,14 +17,26 @@ from ultralytics.utils import LOGGER
 from adas_mt.data.masks import unpack_masks
 
 from .config import MTConfig
-from .metrics import SegConfusion
+from .metrics import SegConfusion, seg_metric_keys
 
 
 class MultiTaskValidator(DetectionValidator):
-    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None, mt: MTConfig | None = None):
+    def __init__(self, dataloader=None, save_dir=None, args=None, _callbacks=None, mt: MTConfig | None = None,
+                 seg_names: tuple | None = None):
+        """``seg_names=(da_names, ll_names, da_nc, ll_nc)`` pre-declares the metric columns (the trainer passes it)."""
         super().__init__(dataloader, save_dir, args, _callbacks)
         self.mt = mt or MTConfig()
         self._seg: tuple | None = None
+        self.seg_keys: list = []
+        if seg_names:
+            self.set_seg_keys(*seg_names)
+
+    def set_seg_keys(self, da_names, ll_names, da_nc, ll_nc) -> None:
+        """Result keys the segmentation metrics add (``metrics/<key>`` in ``trainer.metrics`` / results.csv).
+
+        Deliberately NOT folded into ``DetMetrics.keys``: Ultralytics zips ``keys`` with the four detection values
+        (``results_dict``) and sizes the console table from it, so extending it misaligns both."""
+        self.seg_keys = [f"metrics/{k}" for k in seg_metric_keys("da", da_names, da_nc) + seg_metric_keys("ll", ll_names, ll_nc)]
 
     # ------------------------------------------------------------------ data
     def build_dataset(self, img_path: str, mode: str = "val", batch: int | None = None):
@@ -50,8 +62,15 @@ class MultiTaskValidator(DetectionValidator):
         base = model.model if getattr(model, "format", None) == "pt" else model
         self.da_classes = int(getattr(base, "da_classes", None) or self.data["da_classes"])
         self.ll_classes = int(getattr(base, "ll_classes", None) or self.data["ll_classes"])
-        self.da = SegConfusion(self.da_classes, getattr(base, "da_names", None) or self.data.get("da_names", []), self.device)
-        self.ll = SegConfusion(self.ll_classes, getattr(base, "ll_names", None) or self.data.get("ll_names", []), self.device)
+        # the dataset packs the mask with data.yaml's class counts; a model with other counts decodes garbage
+        for key, have in (("da_classes", self.da_classes), ("ll_classes", self.ll_classes)):
+            if int(self.data[key]) != have:
+                raise ValueError(f"data.yaml {key}={self.data[key]} but the model has {have}")
+        da_names = getattr(base, "da_names", None) or self.data.get("da_names", [])
+        ll_names = getattr(base, "ll_names", None) or self.data.get("ll_names", [])
+        self.da = SegConfusion(self.da_classes, da_names, self.device)
+        self.ll = SegConfusion(self.ll_classes, ll_names, self.device)
+        self.set_seg_keys(da_names, ll_names, self.da_classes, self.ll_classes)
 
     # ---------------------------------------------------------------- per batch
     def postprocess(self, preds: Dict[str, Any]):  # type: ignore[override]
@@ -98,3 +117,28 @@ class MultiTaskValidator(DetectionValidator):
             + f"\n{'lane':>22}  IoU(fg) {ll['ll_IoU_fg']:.3f}  recall {ll['ll_recall_fg']:.3f}  mIoU {ll['ll_mIoU']:.3f}  "
             + " ".join(f"{n} {ll[f'll_IoU_{n}']:.3f}" for n in self.ll.names)
         )
+
+
+def run_validation(weights, data, batch: int = 16, device: str = "", split: str = "val", imgsz=None, cfg_path=None):
+    """Validate a checkpoint standalone. Geometry: explicit ``imgsz`` > ``<run>/mt.yaml`` next to the weights >
+    ``cfg_path`` / defaults (with a warning: validating at another geometry than the one trained silently
+    changes every metric). Returns ``(stats, validator)``."""
+    from pathlib import Path
+
+    from ultralytics.cfg import get_cfg
+
+    run_cfg = MTConfig.find_run_cfg(weights)
+    if run_cfg:
+        mt = MTConfig.load(run_cfg)
+    else:
+        mt = MTConfig.load(cfg_path) if cfg_path else MTConfig()
+        LOGGER.warning(f"no mt.yaml next to {weights}: assuming imgsz={tuple(mt.imgsz)} (pass --imgsz to be sure)")
+    if imgsz:
+        mt = MTConfig.from_dict({**mt.to_dict(), "imgsz": list(imgsz)})
+    args = get_cfg(overrides={
+        "model": str(weights), "data": str(data), "batch": batch, "imgsz": max(mt.imgsz), "device": device, "split": split,
+        "nms": False, "plots": False, "conf": 0.001, "mode": "val", "project": str(Path.cwd() / "runs" / "mt"), "name": "val",
+        "exist_ok": True,
+    })
+    validator = MultiTaskValidator(args=args, mt=mt)
+    return validator(model=str(weights)), validator

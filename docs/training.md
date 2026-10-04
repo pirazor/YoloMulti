@@ -8,7 +8,7 @@ close_mosaic, DDP, resume, plots and checkpoints are the stock ones).
 1. convert   python -m adas_mt convert -- --src <supervisely> --dst data/bdd --group_regex '^([0-9a-f]{8})-'
 2. Stage A   python -m adas_mt.distill.pretrain --images data/bdd --scale s --weights yolo26s.pt --teacher dinov3_b   (optional)
 3. Stage B   python -m adas_mt train --data data/bdd/data.yaml --model <yolo26s.pt | runs/distill/exp/last.pt> --distill --device 0,1,2,3
-4. validate  python -m adas_mt val --weights runs/mt/exp/weights/best.pt --data data/bdd/data.yaml
+4. validate  python -m adas_mt val --weights runs/mt/exp/weights/best.pt --data data/bdd/data.yaml   # geometry read from runs/mt/exp/mt.yaml
 ```
 Ablation A0..A3 from the plan: A1 = Stage B without `--distill`; A2 = with `--distill`; A3 = A2 started from the Stage A checkpoint.
 
@@ -20,7 +20,7 @@ Ablation A0..A3 from the plan: A1 = Stage B without `--distill`; A2 = with `--di
   run directory is handed over through `ADAS_MT_CFG`, because Ultralytics deletes the run directory before spawning workers).
 
 Defaults worth knowing:
-* `optimizer: AdamW, lr0: 0.001` set explicitly. `optimizer=auto` switches to MuSGD on runs over 10k iterations and ignores `lr0`.
+* `optimizer: AdamW, lr0: 0.001, warmup_bias_lr: 0.0` set explicitly. `optimizer=auto` switches to MuSGD on runs over 10k iterations and ignores `lr0`.
 * **`nms: false`**: validation uses the NMS-free head that ships. Ultralytics' default (`None`) validates the one-to-many head + NMS, which is not the deployed model.
 * `head_lr_mult: 3`: `da_head`, `ll_head` and `kd_proj` are freshly initialised; the pretrained trunk keeps the base LR.
 * `amp: true` runs the fp16 AMP check (needs to download `yolo26n.pt`); use `amp: bf16` on A100/H100 to skip it.
@@ -49,8 +49,19 @@ projector is part of the model, so it is synchronised like any other parameter. 
 
 ## Resume
 `python -m adas_mt train --data ... --resume runs/mt/exp/weights/last.pt` restores epoch, optimizer, EMA, the
-`E2ELoss` one-to-many/one-to-one schedule and the distillation schedule/teacher (from `<run>/mt.yaml`).
-Interrupt-safe: a clean stop strips `last.pt` (Ultralytics behaviour); only a crash/kill leaves it resumable.
+`E2ELoss` one-to-many/one-to-one schedule and the distillation schedule/teacher. The run's own `<run>/mt.yaml` is
+**authoritative** on resume (multi-task flags such as `--distill` are ignored with a warning, and the file is never rewritten):
+toggling distillation or the image size would change the optimizer parameter groups and break the resume.
+A clean stop strips `last.pt` (Ultralytics behaviour); only a crash/kill leaves it resumable.
+
+## Precision notes
+* With `amp: true` Ultralytics validates in fp16 (also when training with `amp: bf16`): that matches the FP16 TensorRT deployment, so a
+  large drop between epoch metrics and fp32 would be a deployment warning, not noise.
+* The DINOv3 teacher uses bf16 on GPUs with native bf16 and fp16 otherwise (`mt.distill.teacher_dtype` overrides); non-finite teacher
+  output skips the distillation step with a warning.
+* `batch: -1` (autobatch) profiles a square `imgsz x imgsz` input and does not account for the teacher: set `batch` explicitly.
+* `compile: true` is not tested.
+* `val/kd_loss`, `val/kd_cos` are always 0 (the EMA model has no distiller); the train items are averaged over `every` steps.
 
 ## Tests
 `tests/test_adas_mt/test_trainer.py`: full runs on the colour-coded toy set (distillation on, EMA/optimizer contents, SGD/MuSGD regrouping,

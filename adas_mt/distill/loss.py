@@ -15,6 +15,7 @@ from typing import Dict, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ultralytics.utils import LOGGER
 
 from .teacher import FrozenTeacher
 
@@ -69,6 +70,7 @@ class Distiller:
         self.n_aff = n_aff_tokens
         self.progress = 0.0
         self._calls = 0
+        self._nonfinite = 0
         self.model = model
         if not hasattr(model, "kd_proj"):
             raise RuntimeError(
@@ -88,6 +90,11 @@ class Distiller:
     def lam(self) -> float:
         return self.w1 + 0.5 * (self.w0 - self.w1) * (1.0 + math.cos(math.pi * self.progress))
 
+    def _skipped(self, p3, p4):
+        # keep the projector in the autograd graph: DDP raises on parameters that received no gradient
+        zero = self.model.kd_proj(torch.cat([F.adaptive_avg_pool2d(p3, p4.shape[-2:]), p4], 1)).sum() * 0.0
+        return zero, {"kd_loss": zero.detach(), "kd_cos": zero.detach()}
+
     def student_tokens(self, p3: torch.Tensor, p4: torch.Tensor, grid: Tuple[int, int]) -> torch.Tensor:
         s = torch.cat([F.adaptive_avg_pool2d(p3, p4.shape[-2:]), p4], 1)
         z = self.model.kd_proj(s)
@@ -101,13 +108,17 @@ class Distiller:
         """``img``: (B,3,H,W) RGB, uint8 or float in [0,1]. Returns (weighted loss, items)."""
         self._calls += 1
         if (self._calls - 1) % self.every:  # skipped step: no teacher forward
-            # keep the projector in the autograd graph: DDP raises on parameters that received no gradient
-            zero = self.model.kd_proj(torch.cat([F.adaptive_avg_pool2d(p3, p4.shape[-2:]), p4], 1)).sum() * 0.0
-            return zero, {"kd_loss": zero.detach(), "kd_cos": zero.detach()}
+            return self._skipped(p3, p4)
         img = img.float() / 255.0 if img.dtype == torch.uint8 else img.float()
         if next(self.teacher.parameters()).device != img.device:  # e.g. model moved after the distiller was built
             self.teacher.to(img.device)
         t, grid = self.teacher(img)
+        if not torch.isfinite(t).all():  # e.g. fp16 overflow in a large teacher: skip, never poison the student
+            self._nonfinite += 1
+            if self._nonfinite in (1, 10, 100) or self._nonfinite % 1000 == 0:
+                LOGGER.warning(f"teacher produced non-finite tokens ({self._nonfinite} steps skipped so far); "
+                               "set mt.distill.teacher_dtype: bfloat16 or float32")
+            return self._skipped(p3, p4)
         z = self.student_tokens(p3, p4, grid)
         cos, aff = distill_terms(z, t, self.n_aff)
         loss = self.w_cos * cos + self.w_aff * aff

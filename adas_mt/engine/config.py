@@ -24,6 +24,7 @@ class DistillCfg:
     teacher: str = "dinov3_b"  # alias from adas_mt.distill.ALIASES, or any timm model name
     teacher_pretrained: bool = True  # False -> random init (tests only)
     teacher_ckpt: Optional[str] = None  # local weights when the hub is unreachable
+    teacher_dtype: str = "auto"  # auto (bf16 on native-bf16 GPUs, else fp16) | float32 | bfloat16 | float16
     teacher_scale: float = 1.0
     weight: float = 1.0
     weight_end: float = 0.1
@@ -51,15 +52,28 @@ class MTConfig:
         if unknown:
             raise ValueError(f"unknown mt config keys: {sorted(unknown)} (valid: {sorted(known)})")
         dist = d.pop("distill", None) or {}
+        if not isinstance(dist, dict):
+            raise ValueError(f"mt.distill must be a mapping (enabled: true, teacher: ...), got {dist!r}")
         bad = set(dist) - {f.name for f in fields(DistillCfg)}
         if bad:
             raise ValueError(f"unknown mt.distill keys: {sorted(bad)}")
         cfg = cls(**d, distill=DistillCfg(**dist))
-        cfg.imgsz = tuple(int(x) for x in cfg.imgsz)
-        if len(cfg.imgsz) != 2 or any(x % 32 for x in cfg.imgsz):
-            raise ValueError(f"imgsz must be (h, w), both multiples of 32, got {cfg.imgsz}")
+        try:
+            cfg.imgsz = tuple(int(x) for x in cfg.imgsz)
+        except TypeError:
+            raise ValueError(f"imgsz must be a list [h, w], got {cfg.imgsz!r}") from None
+        if len(cfg.imgsz) != 2 or any(x <= 0 or x % 32 for x in cfg.imgsz):
+            raise ValueError(f"imgsz must be (h, w), both positive multiples of 32, got {cfg.imgsz}")
+        for name, allowed, have in (("loss_gains", {"da", "ll"}, cfg.loss_gains), ("fitness", {"det", "da", "ll"}, cfg.fitness)):
+            bad = set(have) - allowed
+            if bad:
+                raise ValueError(f"unknown mt.{name} keys {sorted(bad)} (valid: {sorted(allowed)})")
         cfg.loss_gains = {"da": 1.0, "ll": 1.0, **cfg.loss_gains}
         cfg.fitness = {"det": 0.5, "da": 0.25, "ll": 0.25, **cfg.fitness}
+        if not cfg.head_lr_mult > 0:
+            raise ValueError(f"head_lr_mult must be > 0, got {cfg.head_lr_mult}")
+        if cfg.distill.teacher_dtype not in {"auto", "float32", "bfloat16", "float16"}:
+            raise ValueError(f"mt.distill.teacher_dtype {cfg.distill.teacher_dtype!r} invalid")
         return cfg
 
     @classmethod
@@ -78,8 +92,16 @@ class MTConfig:
         path.write_text(yaml.safe_dump(self.to_dict(), sort_keys=False), encoding="utf-8")
         return path
 
+    @staticmethod
+    def find_run_cfg(path: "str | Path | bool | None") -> Optional[Path]:
+        """``<run>/mt.yaml`` for a checkpoint ``<run>/weights/<x>.pt`` (None for ``resume=True`` or no file)."""
+        if not isinstance(path, (str, Path)) or not str(path):
+            return None
+        near = Path(path).resolve().parent.parent / "mt.yaml"
+        return near if near.is_file() else None
+
     @classmethod
-    def resolve(cls, mt: "MTConfig | Dict | str | Path | None" = None, resume: str | Path | None = None) -> "MTConfig":
+    def resolve(cls, mt: "MTConfig | Dict | str | Path | None" = None, resume: "str | Path | bool | None" = None) -> "MTConfig":
         """Explicit config > ``ADAS_MT_CFG`` (DDP workers) > ``mt.yaml`` of the run being resumed > defaults."""
         if isinstance(mt, MTConfig):
             return mt
@@ -88,13 +110,12 @@ class MTConfig:
         if mt:
             return cls.load(mt)
         env = os.environ.get(ENV_VAR)
-        if env and Path(env).is_file():
+        if env:
+            if not Path(env).is_file():
+                raise FileNotFoundError(f"{ENV_VAR}={env} does not exist (stale environment variable?)")
             return cls.load(env)
-        if resume:
-            near = Path(resume).resolve().parent.parent / "mt.yaml"  # <run>/weights/last.pt -> <run>/mt.yaml
-            if near.is_file():
-                return cls.load(near)
-        return cls()
+        near = cls.find_run_cfg(resume)
+        return cls.load(near) if near else cls()
 
 
 @contextmanager

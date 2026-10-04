@@ -29,7 +29,8 @@ def _root(tmp_path: Path) -> Path:
 def _overrides(root: Path, **kw):
     base = dict(model="yolo26n.yaml", data=str(root / "data.yaml"), epochs=2, batch=4, workers=0, device="cpu", amp=False,
                 plots=False, close_mosaic=1, optimizer="AdamW", lr0=0.002, project=str(root / "runs"), name="exp",
-                exist_ok=True, warmup_epochs=0, pretrained=False, cache=False, seed=0, val=True)
+                exist_ok=True, warmup_epochs=0, pretrained=False, cache=False, seed=0, val=True,
+                nbs=4)  # nbs == batch -> accumulate 1: every batch takes an optimizer step (else tests never step)
     base.update(kw)
     return base
 
@@ -46,13 +47,16 @@ def test_trains_validates_and_saves_with_distillation(tmp_path):
     assert any(k.startswith("kd_proj") for k in ck["model"].state_dict()), "projector missing from the checkpoint"
     assert isinstance(ck["model"].da_names, list) and ck["model"].ll_names[1] == "solid"
     # the optimizer really contains the new modules at a boosted LR
-    new = [g for g in t.optimizer.param_groups if str(g.get("param_group", "")).endswith("_new")]
+    new = [g for g in t.optimizer.param_groups if g.get("new_head")]
     base = [g for g in t.optimizer.param_groups if not any(g is n for n in new)]
     assert new and base
     assert all(abs(g["initial_lr"] - 3.0 * base[0]["initial_lr"]) < 1e-9 for g in new)  # boosted vs the trunk groups
     assert all(g["initial_lr"] == base[0]["initial_lr"] for g in base)
     ids = {id(p) for g in new for p in g["params"]}
     assert {id(p) for n, p in t.model.named_parameters() if n.startswith(("da_head", "ll_head", "kd_proj"))} == ids
+    # the optimizer really stepped (with the default nbs=64 a 4-batch epoch accumulates and never steps)
+    assert t.ema.updates > 0 and len(t.optimizer.state) > 0
+    assert all(v == v for v in t.metrics.values())
     # validation produced all three task metrics
     for k in ("metrics/mAP50-95(B)", "metrics/da_mIoU", "metrics/ll_IoU_fg", "metrics/da_IoU_fg"):
         assert k in t.metrics, (k, list(t.metrics))
@@ -111,7 +115,7 @@ def test_ddp_worker_rebuilds_the_trainer_with_mt_settings(tmp_path):
     root = _root(tmp_path)
     mt = MTConfig.from_dict({"imgsz": list(HW), "scale": "n", "head_lr_mult": 7.0})
     t = MultiTaskTrainer(overrides=_overrides(root), mt=mt)
-    t.world_size = 2  # as with device="0,1"
+    t.world_size, t.ddp = 2, True  # as with device="0,1" in the launching process
     seen = {}
 
     def fake_base_train(self):
@@ -244,9 +248,171 @@ def test_boosted_head_groups_with_other_optimizers(tmp_path, opt):
                          mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n", "head_lr_mult": 4.0}))
     t.train()
     groups = t.optimizer.param_groups
-    new = [g for g in groups if str(g.get("param_group", "")).endswith("_new")]
+    new = [g for g in groups if g.get("new_head")]
     assert new and all(g["params"] for g in groups)  # no empty groups left behind
     assert all(abs(g["initial_lr"] - 4.0 * min(x["initial_lr"] for x in groups)) < 1e-9 for g in new)
     head_ids = {id(p) for n, p in t.model.named_parameters() if n.startswith(("da_head", "ll_head"))}
     assert head_ids <= {id(p) for g in new for p in g["params"]}
     assert t.metrics and all(v == v for v in t.metrics.values())  # no NaN metric after a step with the regrouped optimizer
+
+
+# ------------------------------------------------------------------ fixes from the Phase 4 review
+def test_cli_resume_uses_the_runs_own_mt_yaml_and_does_not_rewrite_it(tmp_path):
+    from adas_mt.cli import main
+
+    root = _root(tmp_path)
+    mt = {"imgsz": list(HW), "scale": "n", "distill": {"enabled": True, "teacher": "vit_tiny_patch16_224",
+                                                         "teacher_pretrained": False}}
+    t = MultiTaskTrainer(overrides=_overrides(root, epochs=2), mt=MTConfig.from_dict(mt))
+
+    def crash(trainer):
+        raise RuntimeError("simulated crash")
+
+    t.add_callback("on_model_save", crash)
+    with pytest.raises(RuntimeError):
+        t.train()
+    before = (t.save_dir / "mt.yaml").read_text()
+    assert yaml.safe_load(before)["distill"]["enabled"]
+    # default.yaml has distill disabled: the old CLI passed that config and crashed / overwrote mt.yaml
+    assert main(["train", "--data", str(root / "data.yaml"), "--resume", str(t.wdir / "last.pt"),
+                 "--workers", "0", "--device", "cpu"]) == 0
+    assert (t.save_dir / "mt.yaml").read_text() == before  # not rewritten with default.yaml's distill: false
+    import csv
+
+    rows = [{k.strip(): v for k, v in r.items()} for r in csv.DictReader(open(t.save_dir / "results.csv"))]
+    assert len(rows) == 2 and float(rows[1]["train/kd_loss"]) > 0, "distillation did not continue after the CLI resume"
+
+
+def test_cli_amp_and_cache_strings():
+    import argparse
+
+    from adas_mt.cli import _cli_overrides
+
+    ns = lambda **kw: argparse.Namespace(**{**dict(amp=None, cache=None), **kw})  # noqa: E731
+    assert _cli_overrides(ns(amp="true"))["amp"] is True and _cli_overrides(ns(amp="False"))["amp"] is False
+    assert _cli_overrides(ns(amp="bf16"))["amp"] == "bf16"
+    assert _cli_overrides(ns(cache="true"))["cache"] is True and _cli_overrides(ns(cache="RAM"))["cache"] == "ram"
+    with pytest.raises(ValueError):
+        _cli_overrides(ns(amp="maybe"))
+
+
+def test_standalone_val_uses_the_runs_geometry_and_checks_class_counts(tmp_path):
+    from adas_mt.engine.val import run_validation
+
+    root = _root(tmp_path)
+    t = MultiTaskTrainer(overrides=_overrides(root, epochs=1), mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n"}))
+    t.train()
+    stats, v = run_validation(t.best, root / "data.yaml", batch=4, device="cpu")  # no --imgsz, no --cfg
+    assert tuple(v.mt.imgsz) == HW, "validated at the default geometry instead of the run's"
+    bad = yaml.safe_load((root / "data.yaml").read_text())
+    bad["da_classes"], bad["da_names"] = 4, ["background", "direct", "alternative", "x"]
+    (root / "bad.yaml").write_text(yaml.safe_dump(bad))
+    with pytest.raises(ValueError, match="da_classes"):
+        run_validation(t.best, root / "bad.yaml", batch=4, device="cpu")
+
+
+def test_results_csv_columns_are_consistent_when_validation_is_skipped(tmp_path):
+    import csv
+
+    root = _root(tmp_path)
+    t = MultiTaskTrainer(overrides=_overrides(root, epochs=2, val=False),
+                         mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n"}))
+    t.train()
+    rows = list(csv.reader(open(t.save_dir / "results.csv")))
+    assert len({len(r) for r in rows}) == 1, [len(r) for r in rows]
+    assert "metrics/da_mIoU" in [c.strip() for c in rows[0]] and "metrics/ll_IoU_fg" in [c.strip() for c in rows[0]]
+
+
+def test_declared_metric_keys_match_what_the_validator_returns(tmp_path):
+    from adas_mt.engine.metrics import SegConfusion, seg_metric_keys
+
+    for nc, names in ((3, ["background", "direct", "alternative"]), (5, ["a", "b"]), (1, ["only"])):
+        got = list(SegConfusion(nc, names).results("da"))
+        assert got == seg_metric_keys("da", names, nc), (nc, got)
+
+
+def test_config_robustness(tmp_path, monkeypatch):
+    for bad, msg in (({"imgsz": 640}, "list"), ({"imgsz": [0, 32]}, "positive"), ({"imgsz": [-32, 640]}, "positive"),
+                     ({"distill": True}, "mapping"), ({"fitness": {"detect": 1}}, "fitness"),
+                     ({"loss_gains": {"dA": 2}}, "loss_gains"), ({"head_lr_mult": 0}, "head_lr_mult"),
+                     ({"distill": {"teacher_dtype": "fp8"}}, "teacher_dtype")):
+        with pytest.raises(ValueError, match=msg):
+            MTConfig.from_dict(bad)
+    monkeypatch.setenv("ADAS_MT_CFG", str(tmp_path / "missing.yaml"))
+    with pytest.raises(FileNotFoundError, match="stale"):
+        MTConfig.resolve()
+    monkeypatch.delenv("ADAS_MT_CFG")
+    assert MTConfig.resolve(resume=True).head_lr_mult == 3.0  # resume=True (bool) used to raise TypeError
+    from adas_mt.cli import _load_cfg
+
+    (tmp_path / "x.yaml").write_text("train: {}\nmt: {}\ndistil: {}\n")
+    with pytest.raises(ValueError, match="top-level"):
+        _load_cfg(tmp_path / "x.yaml")
+
+
+def test_default_run_directory_is_absolute_and_under_runs_mt(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    root = _root(tmp_path / "ds")
+    ov = _overrides(root)
+    ov.pop("project")
+    ov.pop("name")
+    t = MultiTaskTrainer(overrides=ov, mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n"}))
+    assert t.save_dir.parent == (tmp_path / "runs" / "mt").resolve(), t.save_dir  # not runs/detect/train
+    ov["project"] = "rel/proj"
+    t2 = MultiTaskTrainer(overrides=ov, mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n"}))
+    assert t2.save_dir.parent == (tmp_path / "rel" / "proj").resolve()  # not runs/detect/rel/proj
+
+
+def test_imgsz_arg_always_follows_mt_imgsz(tmp_path):
+    root = _root(tmp_path)
+    t = MultiTaskTrainer(overrides=_overrides(root, imgsz=640), mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n"}))
+    assert t.args.imgsz == max(HW)
+
+
+def test_boosted_groups_keep_stock_group_names_for_bias_warmup(tmp_path):
+    """Ultralytics' bias warmup and OOM weight-decay rescale key on `param_group`; the boost must not rename it."""
+    root = _root(tmp_path)
+    t = MultiTaskTrainer(overrides=_overrides(root, epochs=1, warmup_epochs=1, warmup_bias_lr=0.1),
+                         mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n"}))
+    t.train()
+    names = [g["param_group"] for g in t.optimizer.param_groups]
+    assert set(names) <= {"weight", "bn", "bias"} and names.count("bias") == 2  # trunk bias + new-head bias
+    new = [g for g in t.optimizer.param_groups if g.get("new_head")]
+    assert new and any(g["param_group"] == "bias" for g in new)  # new-head biases still get the stock bias warmup
+    assert all(g["param_group"] in {"weight", "bn", "bias"} for g in new)
+
+
+def test_workers_do_not_hand_off_the_config_again(tmp_path):
+    root = _root(tmp_path)
+    t = MultiTaskTrainer(overrides=_overrides(root), mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n"}))
+    t.world_size, t.ddp = 2, False  # what a spawned worker looks like
+    from ultralytics.models.yolo.detect import DetectionTrainer
+
+    seen = {}
+    orig = DetectionTrainer.train
+    DetectionTrainer.train = lambda self: seen.update(env=os.environ.get("ADAS_MT_CFG"))
+    try:
+        t.train()
+    finally:
+        DetectionTrainer.train = orig
+    assert seen["env"] is None  # only the launching process sets ADAS_MT_CFG
+
+
+def test_nonfinite_teacher_tokens_skip_the_step_instead_of_poisoning_the_student():
+    from adas_mt.distill import Distiller, FrozenTeacher
+    from adas_mt.nn import build_model
+
+    class Broken(FrozenTeacher):
+        def forward(self, img01):
+            t, g = super().forward(img01)
+            return t * float("nan"), g
+
+    teacher = Broken("vit_tiny_patch16_224", pretrained=False)
+    m = build_model("n", nc=2, kd_dim=teacher.dim).train()
+    d = Distiller(m, teacher)
+    x = torch.rand(1, 3, 96, 160)
+    _, p3, p4 = m.features(x)
+    loss, items = d.loss_from_feats(p3, p4, x)
+    assert torch.isfinite(loss) and loss.item() == 0.0 and d._nonfinite == 1
+    loss.backward()  # still differentiable (DDP-safe)
+    assert all(torch.isfinite(p.grad).all() for p in m.kd_proj.parameters() if p.grad is not None)

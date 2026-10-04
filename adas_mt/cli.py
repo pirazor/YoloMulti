@@ -15,13 +15,30 @@ DEFAULT_CFG = Path(__file__).parent / "cfg" / "default.yaml"
 def _load_cfg(path: str | Path | None) -> Dict[str, Any]:
     with open(path or DEFAULT_CFG, "r", encoding="utf-8") as f:
         d = yaml.safe_load(f) or {}
+    extra = set(d) - {"train", "mt"}
+    if extra:
+        raise ValueError(f"unknown top-level sections {sorted(extra)} in {path or DEFAULT_CFG} (valid: train, mt)")
     return {"train": dict(d.get("train") or {}), "mt": dict(d.get("mt") or {})}
+
+
+def _bool_or_str(v: Any, allowed: tuple = ()) -> Any:
+    """'true'/'false' (any case) -> bool; other strings must be in ``allowed`` (Ultralytics rejects the rest)."""
+    if isinstance(v, str) and v.lower() in {"true", "false"}:
+        return v.lower() == "true"
+    if isinstance(v, str) and allowed and v.lower() not in allowed:
+        raise ValueError(f"invalid value {v!r}; expected true, false or one of {allowed}")
+    return v.lower() if isinstance(v, str) else v
 
 
 def _cli_overrides(a: argparse.Namespace) -> Dict[str, Any]:
     """Only the flags that were actually given override the YAML."""
     keys = ("epochs", "batch", "device", "workers", "project", "name", "optimizer", "lr0", "amp", "cache", "seed", "patience")
-    return {k: getattr(a, k) for k in keys if getattr(a, k, None) is not None}
+    out = {k: getattr(a, k) for k in keys if getattr(a, k, None) is not None}
+    if "amp" in out:
+        out["amp"] = _bool_or_str(out["amp"], ("bf16", "fp16", "fp32"))
+    if "cache" in out:
+        out["cache"] = _bool_or_str(out["cache"], ("ram", "disk"))  # cache=True means RAM; the string 'true' means nothing
+    return out
 
 
 def cmd_train(a: argparse.Namespace) -> int:
@@ -29,34 +46,41 @@ def cmd_train(a: argparse.Namespace) -> int:
 
     cfg = _load_cfg(a.cfg)
     mt = dict(cfg["mt"])
+    given = {}
     if a.imgsz:
-        mt["imgsz"] = list(a.imgsz)
+        given["imgsz"] = list(a.imgsz)
     if a.scale:
-        mt["scale"] = a.scale
+        given["scale"] = a.scale
+    dist = {}
     if a.distill is not None:
-        mt.setdefault("distill", {})["enabled"] = a.distill
+        dist["enabled"] = a.distill
     if a.teacher:
-        mt.setdefault("distill", {})["teacher"] = a.teacher
+        dist["teacher"] = a.teacher
     if a.teacher_ckpt:
-        mt.setdefault("distill", {})["teacher_ckpt"] = a.teacher_ckpt
+        dist["teacher_ckpt"] = a.teacher_ckpt
     overrides = {**cfg["train"], **_cli_overrides(a), "data": str(a.data), "model": a.model}
+    overrides.pop("imgsz", None)  # the geometry is mt.imgsz
     if a.resume:
+        # The run's own mt.yaml is authoritative (see MultiTaskTrainer); multi-task flags would conflict with it.
+        if given or dist:
+            logging.getLogger("adas_mt").warning("--resume: ignoring --imgsz/--scale/--distill/--teacher flags; "
+                                                 "the run's mt.yaml is used")
         overrides["resume"] = str(a.resume)
-    trainer = MultiTaskTrainer(overrides=overrides, mt=MTConfig.from_dict(mt))
+        trainer = MultiTaskTrainer(overrides=overrides, mt=None)
+    else:
+        mt.update(given)
+        if dist:
+            mt["distill"] = {**(mt.get("distill") or {}), **dist}
+        trainer = MultiTaskTrainer(overrides=overrides, mt=MTConfig.from_dict(mt))
     trainer.train()
     return 0
 
 
 def cmd_val(a: argparse.Namespace) -> int:
-    from ultralytics.cfg import get_cfg
+    from adas_mt.engine.val import run_validation
 
-    from adas_mt.engine import MTConfig, MultiTaskValidator
-
-    cfg = _load_cfg(a.cfg)
-    mt = MTConfig.from_dict({**cfg["mt"], **({"imgsz": list(a.imgsz)} if a.imgsz else {})})
-    args = get_cfg(overrides={"model": str(a.weights), "data": str(a.data), "batch": a.batch, "imgsz": max(mt.imgsz),
-                              "device": a.device or "", "split": a.split, "nms": False, "plots": False, "conf": 0.001})
-    stats = MultiTaskValidator(args=args, mt=mt)(model=str(a.weights))
+    stats, _ = run_validation(a.weights, a.data, batch=a.batch, device=a.device or "", split=a.split,
+                              imgsz=a.imgsz, cfg_path=a.cfg)
     print(yaml.safe_dump({k: round(float(v), 5) for k, v in stats.items()}, sort_keys=False))
     return 0
 
@@ -93,8 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
         t.add_argument(f"--{k}", type=ty, default=None)
     for k in ("device", "project", "name", "optimizer"):
         t.add_argument(f"--{k}", default=None)
-    t.add_argument("--amp", default=None, help="true | false | bf16")
-    t.add_argument("--cache", default=None)
+    t.add_argument("--amp", default=None, help="true | false | bf16 | fp16 | fp32")
+    t.add_argument("--cache", default=None, help="true (=ram) | false | ram | disk")
     t.set_defaults(func=cmd_train)
 
     v = sub.add_parser("val", help="validate a checkpoint on the val split")

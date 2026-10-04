@@ -15,8 +15,8 @@ its source. They are the contract between `adas_mt` and the trainer.
    `model.loss_gains`, never through `model.args`.
 5. **Class counts.** The packed mask is decoded with the model's class counts: call
    `check_matches_data(model, data)` once at start-up.
-6. **`multi_scale`.** Upstream `preprocess_batch` resizes only `img`; with `multi_scale > 0` the trainer must also resize
-   `semantic_mask` (nearest). Keep `multi_scale=0` until that is implemented.
+6. **`multi_scale`.** Upstream `preprocess_batch` resizes only `img`; the trainer also resizes `semantic_mask`
+   (nearest), so `multi_scale > 0` works (tested).
 7. **Optimizer.** `optimizer=auto` selects MuSGD for runs over 10k iterations and boosts the learning rate x3 only for
    heads it recognises by name (`cv3`, `SemanticSegment`). `da_head`, `ll_head` and `kd_proj` are new modules and need
    the same boost; set the optimizer explicitly instead of relying on `auto` (which also overrides `lr0`).
@@ -40,3 +40,22 @@ its source. They are the contract between `adas_mt` and the trainer.
 14. **Standalone validation** wraps the model in `AutoBackend`, which exposes none of the model's attributes: the
     validator reads class counts from the underlying model or `data.yaml`.
 15. **`pretrained=False`** discards weights even when `model` is a `.pt`; the default (`True`) keeps them.
+
+## Found by the independent review of the trainer (all fixed, each with a test)
+16. **CLI `--resume`** passed `default.yaml`'s multi-task config, which beat the run's own `mt.yaml` (distillation off), crashed the
+    optimizer-state load and overwrote `mt.yaml`. The run's `mt.yaml` is now authoritative on resume and is never rewritten.
+17. **`--amp true|false` / `--cache true`** were passed as strings (Ultralytics rejects the first, silently ignores the second).
+18. **Standalone `val`** used default.yaml's imgsz instead of the run's (mAP50-95 0.46 -> 0.0 with no warning) and never checked
+    the class counts against `data.yaml`; it now reads `<run>/mt.yaml` and raises on a mismatch.
+19. **`results.csv`** got a short header when validation was skipped in early epochs and long rows later; the segmentation columns are
+    now pre-seeded. (Extending `DetMetrics.keys` was tried and rejected: Ultralytics zips it with four values and sizes the console table from it.)
+20. **Tests never stepped the optimizer** (`nbs=64` with batch 4 accumulates 16 batches); they now use `nbs=4` and assert EMA updates.
+21. **Output paths:** a relative `project` landed in `runs/detect/<project>`; the default is now an absolute `<cwd>/runs/mt/exp`
+    and standalone `val` no longer creates an empty `runs/detect/train`.
+22. **`imgsz: 640`** in default.yaml stayed in `args.imgsz` (multi_scale range, autobatch); it now always follows `mt.imgsz`.
+23. The **DDP hand-off** ran in every spawned worker; only the launching process does it now (`self.ddp`).
+24. **Group names:** the boosted groups had been renamed (`bias_new`) and missed the stock bias warmup and weight-decay rescale; they keep
+    the stock names and carry `new_head=True`. default.yaml sets `warmup_bias_lr: 0.0` for the explicit AdamW (what `optimizer=auto` forces).
+25. **Config validation** is strict (types, positive multiples of 32, unknown `fitness`/`loss_gains` keys, `head_lr_mult > 0`, stale `ADAS_MT_CFG`,
+    unknown top-level YAML sections); the effective model scale is recorded in `mt.yaml`.
+26. **Teacher safety:** `mt.distill.teacher_dtype` is configurable and a non-finite teacher output skips the step (with a warning) instead of poisoning the student.

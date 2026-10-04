@@ -4,13 +4,13 @@
 train:
   epochs: 100
   batch: 32
-  imgsz: 640              # max side (Ultralytics wants an int); the real (h, w) is mt.imgsz
   optimizer: AdamW        # explicit: `auto` switches to MuSGD and overrides lr0 on long runs
   lr0: 0.001
   lrf: 0.01
   momentum: 0.9
   weight_decay: 0.0005
   warmup_epochs: 3
+  warmup_bias_lr: 0.0     # `optimizer=auto` forces 0.0 for Adam-family; the stock 0.1 start is for SGD
   cos_lr: false
   close_mosaic: 10
   patience: 30

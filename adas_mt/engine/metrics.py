@@ -51,3 +51,12 @@ class SegConfusion:
             out[f"{prefix}_recall_fg"] = float(inter / g_fg) if g_fg > 0 else 0.0  # "lane accuracy"
         out[f"{prefix}_pixel_acc"] = float(tp.sum() / m.sum()) if m.sum() > 0 else 0.0
         return out
+
+
+def seg_metric_keys(prefix: str, names: Sequence[str], nc: int) -> list:
+    """The keys ``SegConfusion.results`` produces, in order (used to pre-declare the CSV columns)."""
+    names = list(names)[:nc] + [f"class{i}" for i in range(len(names), nc)]
+    keys = [f"{prefix}_mIoU"] + [f"{prefix}_IoU_{n}" for n in names]
+    if nc > 1:
+        keys += [f"{prefix}_IoU_fg", f"{prefix}_recall_fg"]
+    return keys + [f"{prefix}_pixel_acc"]
