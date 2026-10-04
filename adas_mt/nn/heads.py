@@ -41,7 +41,7 @@ class DAHead(nn.Module):
         x = self.lat3(p3)
         x = x + _up(self.lat4(p4), x)
         logits = F.interpolate(self.cls(self.mix(x)), size=tuple(size), mode="bilinear", align_corners=False)
-        if self.training:
+        if self.training and self.aux is not None:
             aux = F.interpolate(self.aux(p4), size=tuple(size), mode="bilinear", align_corners=False)
             return logits, aux
         return logits, None

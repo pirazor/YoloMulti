@@ -86,7 +86,26 @@ class MultiTaskModel(DetectionModel):
         out: Dict[str, object] = {"det": det, "da": da, "ll": ll}
         if da_aux is not None:
             out["da_aux"] = da_aux
+        if self.training:
+            out["feats"] = (p3, p4)  # neck features for feature distillation
         return out
+
+    def features(self, x: torch.Tensor):
+        """Backbone + neck only (no Detect, no segmentation heads): returns ``(p2, p3, p4)``."""
+        y: list = []
+        for m in self.model[:-1]:
+            if m.f != -1:
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
+            x = m(x)
+            y.append(x if m.i in self.save else None)
+        return y[P2_LAYER], y[self.p3_layer], y[self.p4_layer]
+
+    def strip_training_only(self):
+        """Drop modules only used for training (distillation projector, DA auxiliary classifier)."""
+        if hasattr(self, "kd_proj"):
+            del self.kd_proj
+        self.da_head.aux = None
+        return self
 
     # ------------------------------------------------------------------- loss
     def init_criterion(self):  # type: ignore[override]

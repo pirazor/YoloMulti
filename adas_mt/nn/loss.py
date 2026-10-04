@@ -64,7 +64,8 @@ def masked_focal_tversky(
 class MultiTaskLoss:
     """Callable criterion for :class:`adas_mt.nn.model.MultiTaskModel`."""
 
-    def __init__(self, model, w_da: float | None = None, w_ll: float | None = None):
+    def __init__(self, model, w_da: float | None = None, w_ll: float | None = None, distiller=None):
+        self.distiller = distiller  # adas_mt.distill.Distiller or None
         det = model.model[-1]
         self.det = E2ELoss(model) if getattr(det, "one2one_cv2", None) is not None else v8DetectionLoss(model)
         self.device = next(model.parameters()).device
@@ -91,7 +92,11 @@ class MultiTaskLoss:
         det_loss, det_items = self.det(preds["det"], batch)  # (3,) * batch_size, dict
         bs = batch["img"].shape[0]
         l_da, l_ll = self.seg_losses(preds, batch)
-        loss = torch.cat([det_loss.reshape(-1), (self.w_da * l_da * bs).reshape(1), (self.w_ll * l_ll * bs).reshape(1)])
+        parts = [det_loss.reshape(-1), (self.w_da * l_da * bs).reshape(1), (self.w_ll * l_ll * bs).reshape(1)]
         items = dict(det_items)
         items["da_loss"], items["ll_loss"] = l_da.detach(), l_ll.detach()
-        return loss, items
+        if self.distiller is not None:
+            l_kd, kd_items = self.distiller(preds, batch)
+            parts.append((l_kd * bs).reshape(1))
+            items.update(kd_items)
+        return torch.cat(parts), items
