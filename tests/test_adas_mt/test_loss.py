@@ -103,6 +103,28 @@ def test_overfits_a_tiny_batch():
     assert last["ll_loss"] < 0.8 * first["ll_loss"], (first, last)
 
 
+def test_region_losses_average_over_classes_present_in_the_batch():
+    """An absent class has Dice ~0 whatever is predicted (constant ~1.0 term, ~0 gradient): it must not be averaged in."""
+    torch.manual_seed(0)
+    target = torch.zeros(2, 16, 24, dtype=torch.long)
+    target[:, 8:, :] = 1  # class 2 ("alternative") absent
+    logits = torch.full((2, 3, 16, 24), -6.0)
+    logits[:, 0][target == 0] = 6.0
+    logits[:, 1][target == 1] = 6.0  # near-perfect prediction of the present classes
+    assert masked_dice(logits, target).item() < 0.01 and masked_focal_tversky(logits, target).item() < 0.05
+    only_bg = torch.zeros(2, 16, 24, dtype=torch.long)
+    for fn in (masked_dice, masked_focal_tversky):
+        logits_g = logits.clone().requires_grad_(True)
+        loss = fn(logits_g, only_bg)  # no foreground GT at all: zero, finite zero gradient, CE does the work
+        assert loss.item() == 0.0
+        loss.backward()
+        assert torch.isfinite(logits_g.grad).all() and torch.count_nonzero(logits_g.grad) == 0
+    # a present class that is predicted badly still costs (uniform uncertainty on its pixels: Dice loss ~0.5)
+    bad = logits.clone()
+    bad[:, 1] = -6.0
+    assert masked_dice(bad, target).item() > 0.4 and masked_focal_tversky(bad, target).item() > 0.5
+
+
 def test_class_id_without_a_channel_is_ignored_not_clamped():
     """Previously target 5 with C=3 was clamped onto class 2 and trained as 'dashed'."""
     torch.manual_seed(0)

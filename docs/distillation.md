@@ -30,7 +30,12 @@ Because the teacher costs cloud GPU time, not Jetson time, a larger teacher is a
 are not guaranteed for a 10M-parameter student (capacity gap), so compare `dinov3_b` vs `dinov3_l` in the ablation.
 Teacher runs in bf16 autocast on CUDA (`dtype="auto"`); `--every k` distils every k-th step; `--teacher_scale 0.5` runs
 the teacher at half resolution (4x cheaper, coarser targets).
-Use `--teacher_ckpt /path/teacher.safetensors` when the machine cannot reach the Hugging Face hub.
+Use `--teacher_ckpt <file>` when the machine cannot reach the Hugging Face hub: both the timm file from the hub
+(`model.safetensors` of `timm/vit_base_patch16_dinov3.lvd1689m`) and Meta's official `dinov3_vit*16_pretrain_lvd1689m-*.pth`
+are accepted (Meta's key names are converted like timm's downloader does); a file that does not match the architecture
+raises instead of loading partially. Smoke-test the real weights once on the training box before a long run:
+`python -c "import torch; from adas_mt.distill import FrozenTeacher; t=FrozenTeacher('dinov3_b'); x,g=t(torch.rand(1,3,384,640)); print(g, x.shape, torch.isfinite(x).all())"`
+should print `(24, 40) torch.Size([1, 960, 768]) tensor(True)`.
 `--teacher_scale` / `dtype="auto"` pick bf16 only on GPUs with native bf16 (A100/H100/L4), fp16 otherwise.
 
 ## Stage A: distillation-only pretraining on unlabelled frames

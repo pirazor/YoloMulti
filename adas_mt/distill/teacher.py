@@ -57,6 +57,14 @@ class FrozenTeacher(nn.Module):
         self.eval()  # wrapper + timm model; train() below keeps it in eval
 
     def _load_local(self, path: str | Path) -> None:
+        """Load timm-format (HF hub safetensors) or Meta-format (official ``dinov3_*_pretrain_*.pth``) weights.
+
+        Meta's files use their own key names (``storage_tokens``, ``blocks.N.ls1.gamma``, ``rope_embed.periods``,
+        ``mask_token``); timm renames them in ``checkpoint_filter_fn`` when it downloads, which a direct
+        ``load_state_dict`` bypassed, so the only offline path refused the only file an offline user can get. The
+        load is strict: a teacher with a randomly initialised register token or layer scale is not a teacher."""
+        from timm.models.eva import checkpoint_filter_fn
+
         path = str(path)
         if path.endswith(".safetensors"):
             from safetensors.torch import load_file
@@ -64,10 +72,22 @@ class FrozenTeacher(nn.Module):
             sd = load_file(path)
         else:
             sd = torch.load(path, map_location="cpu", weights_only=True)
-            sd = sd.get("state_dict", sd.get("model", sd)) if isinstance(sd, dict) else sd
+            if isinstance(sd, dict):
+                for key in ("state_dict", "model", "teacher"):
+                    if isinstance(sd.get(key), dict):
+                        sd = sd[key]
+                        break
+        try:
+            sd = checkpoint_filter_fn(sd, self.model)  # no-op for timm-format files
+        except Exception as e:  # e.g. a pos_embed from another architecture against a RoPE model (pos_embed=None)
+            raise ValueError(f"teacher checkpoint {path} does not match {self.name}: {e}") from e
         missing, unexpected = self.model.load_state_dict(sd, strict=False)
-        if len(missing) > 0.1 * len(self.model.state_dict()):
-            raise ValueError(f"teacher checkpoint {path} does not match {self.name}: {len(missing)} missing keys")
+        unexpected = [k for k in unexpected if not k.startswith(("head.", "fc_norm."))]  # a classifier head is fine
+        if missing or unexpected:
+            raise ValueError(
+                f"teacher checkpoint {path} does not match {self.name}: missing {list(missing)[:5]}{'...' if len(missing) > 5 else ''}, "
+                f"unexpected {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}"
+            )
 
     def train(self, mode: bool = True):  # always eval
         return super().train(False)

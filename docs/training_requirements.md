@@ -128,3 +128,12 @@ its source. They are the contract between `adas_mt` and the trainer.
     trainer's resize, so 4:3 sources no longer get 1.5x thicker lanes.
 52. `build_transforms()` without `hyp` raised `AttributeError` (no caller hit it); `mixup`, `cutmix`, `copy_paste`, `flipud` > 0 now warn that the pipeline does not
     implement them instead of being ignored silently.
+53. **Offline teacher weights did not load.** `FrozenTeacher(checkpoint=...)` fed the file straight into `load_state_dict`, bypassing timm's
+    `checkpoint_filter_fn` that renames Meta's DINOv3 keys (`storage_tokens`, `blocks.N.ls1.gamma`, `rope_embed.periods`, `mask_token`): Meta's official
+    `.pth` (the only file an offline user can get) raised, and the 10%-missing-keys guard would have let a file with only a lost register token load
+    silently. The filter is applied now and the load is strict.
+54. **Region losses over absent classes.** A class without ground truth in the batch has Dice ~0 whatever is predicted (constant ~1.0 term, ~0 gradient), which
+    put a floor of ~0.5 under the logged `da_loss` whenever "alternative" was absent and made the Dice term inert for it. Dice and focal Tversky now average over
+    the foreground classes present in the batch (0 when none); CE still penalises false positives of absent classes.
+55. **Loss balance is measured, not tuned** (docs/training.md): at init the trunk gradient is ~95% detection, and the one-to-one head is detached from the trunk
+    upstream, so the balance drifts with `E2ELoss`'s one-to-many decay. `loss_gains` is the ablation knob; the defaults are unchanged.

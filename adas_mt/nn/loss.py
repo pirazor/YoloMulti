@@ -32,6 +32,12 @@ def masked_ce(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def _region_stats(logits: torch.Tensor, target: torch.Tensor):
+    """Per-class (tp, fp, fn) over valid pixels and the classes to average region losses over.
+
+    Region losses are averaged over the foreground classes that HAVE ground truth in the batch. A class absent from
+    the batch (e.g. DA "alternative" in most ADAS batches) has tp = fn = 0, so its Dice is ~0 whatever the network
+    predicts (loss term ~1.0, gradient ~1/(fp+1)^2 ~ 0): including it only puts a constant floor of ~0.5 under the
+    logged loss while CE already handles its false positives."""
     valid = (target < logits.shape[1]).unsqueeze(1)  # (N,1,H,W)
     probs = logits.softmax(1) * valid
     onehot = F.one_hot(target.clamp(max=logits.shape[1] - 1), logits.shape[1]).permute(0, 3, 1, 2).to(probs.dtype) * valid
@@ -39,28 +45,30 @@ def _region_stats(logits: torch.Tensor, target: torch.Tensor):
     tp = (probs * onehot).sum(dims)
     fp = (probs * (1 - onehot) * valid).sum(dims)
     fn = ((1 - probs) * onehot * valid).sum(dims)
-    return tp, fp, fn
+    present = onehot.sum(dims) > 0  # classes with ground-truth pixels in this batch
+    if present.numel() > 1:
+        present[0] = False  # class 0 = background is never a region-loss target
+    return tp, fp, fn, present
 
 
 def masked_dice(logits: torch.Tensor, target: torch.Tensor, smooth: float = 1.0) -> torch.Tensor:
-    """Dice over foreground classes (class 0 = background excluded); ignored pixels excluded."""
-    tp, fp, fn = _region_stats(logits, target)
+    """Dice over the foreground classes present in the batch; ignored pixels excluded; 0 when none is present."""
+    tp, fp, fn, present = _region_stats(logits, target)
     dice = (2 * tp + smooth) / (2 * tp + fp + fn + smooth)
-    return 1.0 - dice[1:].mean() if dice.numel() > 1 else 1.0 - dice.mean()
+    return (1.0 - dice[present]).mean() if present.any() else dice.sum() * 0.0  # zero, still in the graph
 
 
 def masked_focal_tversky(
     logits: torch.Tensor, target: torch.Tensor, alpha: float = 0.3, beta: float = 0.7, gamma: float = 0.75,
     smooth: float = 1.0,
 ) -> torch.Tensor:
-    """Focal Tversky over foreground classes (beta > alpha favours recall for thin lanes)."""
-    tp, fp, fn = _region_stats(logits, target)
+    """Focal Tversky over the foreground classes present in the batch (beta > alpha favours recall for thin lanes)."""
+    tp, fp, fn, present = _region_stats(logits, target)
     t = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
-    t = t[1:] if t.numel() > 1 else t
-    # d/dx x**gamma is infinite at 0 (reached when no valid pixel / perfect overlap) -> clamp, and make
-    # an all-ignored batch exactly zero so it cannot produce NaN gradients.
-    loss = ((1.0 - t).clamp_min(1e-6) ** gamma).mean()
-    return loss * (target < logits.shape[1]).any()
+    if not present.any():  # no foreground GT (or every pixel ignored): exactly zero, no NaN gradient
+        return t.sum() * 0.0
+    # d/dx x**gamma is infinite at 0 (reached at perfect overlap) -> clamp
+    return ((1.0 - t[present]).clamp_min(1e-6) ** gamma).mean()
 
 
 class MultiTaskLoss:
