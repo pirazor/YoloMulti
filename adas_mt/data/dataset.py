@@ -40,8 +40,10 @@ def _read_png(path: str) -> np.ndarray | None:
     import os
 
     if not os.path.isfile(path):
-        return None
+        return None  # genuinely unannotated
     m = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if m is None:  # present but unreadable: fail loudly instead of silently training it as "unlabelled"
+        raise OSError(f"corrupt mask file: {path}")
     return m
 
 
@@ -51,6 +53,10 @@ class MultiTaskDataset(YOLODataset):
     format_class = MultiTaskFormat
 
     def __init__(self, *args, data: dict, imgsz: int | tuple[int, int] = (384, 640), **kwargs):
+        if kwargs.get("rect"):
+            # Ultralytics' DetectionTrainer.build_dataset passes rect=True for val, which letterboxes to
+            # per-batch shapes (e.g. 384x672) instead of the 384x640 the deployed model sees.
+            raise ValueError("MultiTaskDataset does not support rect=True; build val datasets with rect=False")
         hw = (int(imgsz), int(imgsz)) if isinstance(imgsz, int) else (int(imgsz[0]), int(imgsz[1]))
         self.imgsz_hw = hw
         self.da_classes = int(data["da_classes"])

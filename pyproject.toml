@@ -7,20 +7,23 @@ name = "adas-mt"
 dynamic = ["version"]
 description = "Efficient multi-task ADAS perception (detection + drivable area + lane) for Jetson Orin Nano"
 requires-python = ">=3.10"
+# Core = what the Jetson runner needs (`predict`, `bench`, `trt-build`); torch and tensorrt come from JetPack, and the
+# OpenCV of a Jetson should be JetPack's (GStreamer). Training / export / eval pull the pinned ultralytics.
 dependencies = [
-    "ultralytics==8.4.171",
     "numpy",
-    "opencv-python-headless",
     "pyyaml",
 ]
 
 [project.optional-dependencies]
-train = ["timm>=1.0.20", "tensorboard"]
-export = ["onnx", "onnxruntime", "onnxslim"]
-dev = ["pytest"]
+train = ["ultralytics==8.4.171", "opencv-python-headless", "timm>=1.0.20", "tensorboard"]
+export = ["ultralytics==8.4.171", "opencv-python-headless", "onnx", "onnxruntime", "onnxslim"]
+dev = ["ultralytics==8.4.171", "opencv-python-headless", "onnx", "onnxruntime", "onnxslim", "timm>=1.0.20", "pytest"]
 
 [tool.setuptools.dynamic]
 version = { attr = "adas_mt.__version__" }
+
+[tool.setuptools.package-data]
+adas_mt = ["cfg/*.yaml"]
 
 [tool.setuptools.packages.find]
 include = ["adas_mt*", "sign_classifier*"]

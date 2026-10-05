@@ -83,6 +83,8 @@ class ConvertStats:
     skipped_degenerate: int = 0
     skipped_unknown_class: Counter = field(default_factory=Counter)
     skipped_tag_parse: int = 0
+    skipped_unmapped: int = 0  # DA/lane objects whose attribute value has no class id
+    renamed_stems: int = 0  # output names disambiguated because two images share a stem
 
 
 def _parse_tags(tags: Optional[Sequence[dict]], stats: ConvertStats) -> Dict[str, str]:
@@ -185,6 +187,16 @@ def _is_degenerate_polygon(pts: np.ndarray) -> bool:
     return area < 1.0
 
 
+def _draw_polygon(mask: np.ndarray, exterior, interior, value: int) -> None:
+    """Fill ``exterior`` with ``value`` but leave Supervisely ``interior`` rings (holes) untouched."""
+    tmp = np.zeros(mask.shape, np.uint8)
+    cv2.fillPoly(tmp, [np.asarray(exterior, np.int32).reshape(-1, 1, 2)], 1)
+    for ring in interior or []:
+        if len(ring) >= 3:
+            cv2.fillPoly(tmp, [np.asarray(ring, np.int32).reshape(-1, 1, 2)], 0)
+    mask[tmp == 1] = value
+
+
 def _line_thickness(image_h: int, ref_px: float = 8.0) -> int:
     """Lane line thickness: ``ref_px`` at 720p, scaled with image height (min 2 px)."""
     return max(2, int(round(ref_px * image_h / 720)))
@@ -203,6 +215,42 @@ def _split_for_path(p: Path, src_root: Path) -> Optional[str]:
         if tok in {"val", "valid", "validation", "test"}:
             return "val"
     return None
+
+
+def assign_val(
+    names: Sequence[str], val_fraction: float, seed: int = 0, group_regex: Optional[str] = None
+) -> set:
+    """Return the set of indices (into ``names``) that go to the val split.
+
+    ``val_fraction == 0`` -> no val images (the old ``max(1, ...)`` forced one). With
+    ``group_regex`` (first capture group = clip/sequence id, e.g. ``^([0-9a-f]{8})-`` for BDD
+    names) whole groups are assigned, so consecutive frames of one clip never straddle
+    train/val. Without it the split is per image, which leaks near-duplicate frames.
+    """
+    n = len(names)
+    if val_fraction <= 0 or n == 0:
+        return set()
+    target = max(1, int(round(n * val_fraction))) if n > 1 else 0
+    rng = random.Random(seed)
+    if group_regex:
+        import re
+
+        rx = re.compile(group_regex)
+        groups: Dict[str, List[int]] = defaultdict(list)
+        for i, nm in enumerate(names):
+            m = rx.search(nm)
+            groups[m.group(1) if m else nm].append(i)  # no match -> its own group
+        keys = sorted(groups)
+        rng.shuffle(keys)
+        val: set = set()
+        for k in keys:
+            if len(val) >= target:
+                break
+            val.update(groups[k])
+        return val
+    idx = list(range(n))
+    rng.shuffle(idx)
+    return set(idx[:target])
 
 
 def _walk_supervisely(src: Path) -> List[Path]:
@@ -254,6 +302,7 @@ def _process_one(
     copy_images: bool,
     lane_thickness: float = 8.0,
     partial_annotation: bool = False,
+    out_stem: Optional[str] = None,
 ) -> None:
     with json_path.open("r", encoding="utf-8") as f:
         ann = json.load(f)
@@ -269,7 +318,7 @@ def _process_one(
             return
         h, w = im.shape[:2]
 
-    stem = img_path.stem
+    stem = out_stem or img_path.stem
     det_lines: List[str] = []
     da_mask = np.zeros((h, w), dtype=np.uint8)
     ll_mask = np.zeros((h, w), dtype=np.uint8)
@@ -281,11 +330,8 @@ def _process_one(
         if not title:
             continue
         gtype = (obj.get("geometryType") or "").strip()
-        if title.lower() == "drivable area":
-            da_seen = True
-        elif title.lower() == "lane":
-            ll_seen = True
         ext = (obj.get("points") or {}).get("exterior") or []
+        holes = (obj.get("points") or {}).get("interior") or []
         attrs = _parse_tags(obj.get("tags"), stats)
 
         if gtype == "rectangle":
@@ -312,10 +358,12 @@ def _process_one(
                 stats.skipped_degenerate += 1
                 continue
             value = DA_VALUE_MAP.get(attrs.get("areaType", "").lower(), 0)
-            if value == 0:
+            if value == 0:  # unmapped areaType: do not count the task as annotated for this image
+                stats.skipped_unmapped += 1
                 continue
             try:
-                cv2.fillPoly(da_mask, [pts.reshape(-1, 1, 2)], value)
+                _draw_polygon(da_mask, pts, holes, value)
+                da_seen = True
                 stats.da_polys += 1
             except cv2.error as e:  # pragma: no cover - defensive
                 LOGGER.warning("DA fillPoly failed on %s: %s", json_path.name, e)
@@ -328,8 +376,10 @@ def _process_one(
                     continue
                 cls_id = _resolve_lane_class_id(attrs, lane_grouping, type_to_id)
                 if cls_id == 0:
+                    stats.skipped_unmapped += 1
                     continue
-                cv2.fillPoly(ll_mask, [pts.reshape(-1, 1, 2)], cls_id)
+                _draw_polygon(ll_mask, pts, holes, cls_id)
+                ll_seen = True
                 stats.ll_polys += 1
             elif gtype == "line":
                 if len(ext) < 2:
@@ -338,8 +388,10 @@ def _process_one(
                 pts = np.asarray(ext, dtype=np.int32).reshape(-1, 1, 2)
                 cls_id = _resolve_lane_class_id(attrs, lane_grouping, type_to_id)
                 if cls_id == 0:
+                    stats.skipped_unmapped += 1
                     continue
                 cv2.polylines(ll_mask, [pts], isClosed=False, color=cls_id, thickness=line_thick)
+                ll_seen = True
                 stats.ll_polys += 1
 
     # Write outputs ----------------------------------------------------------------
@@ -383,10 +435,21 @@ def convert(
     limit: Optional[int] = None,
     lane_thickness: float = 8.0,
     partial_annotation: bool = False,
+    group_regex: Optional[str] = None,
+    overwrite: bool = False,
 ) -> ConvertStats:
     src = Path(src).resolve()
     dst = Path(dst).resolve()
     assert lane_grouping in {"style", "type"}, lane_grouping
+
+    # A second run into the same folder would leave the first run's files behind: images re-split with a
+    # different seed end up in BOTH train and val (leakage) and stale masks survive.
+    existing = [dst / d for d in ("images", "labels_det", "labels_da", "labels_ll") if (dst / d).exists()]
+    if any(f.is_file() for d in existing for f in d.rglob("*")):
+        if not overwrite:
+            raise FileExistsError(f"{dst} already contains a converted dataset; pass overwrite=True / --overwrite")
+        for d in existing:
+            shutil.rmtree(d)
 
     out_dirs = {
         "images": dst / "images",
@@ -420,21 +483,42 @@ def convert(
     if unpaired:
         LOGGER.warning("%d annotations had no matching image", unpaired)
 
+    # output names must be unique: two source datasets with the same file stem would overwrite each other
+    out_stems: Dict[Path, str] = {}
+    used: Dict[str, Path] = {}
+    renamed = 0
+    for _, ip, _ in paired:
+        stem = ip.stem
+        if stem in used and used[stem] != ip:
+            import hashlib
+
+            stem = f"{ip.stem}__{hashlib.sha1(str(ip).encode()).hexdigest()[:8]}"
+            renamed += 1
+        used[stem] = ip
+        out_stems[ip] = stem
+    if renamed:
+        LOGGER.warning("%d images shared a file stem with another image and were renamed", renamed)
+
     have_split = any(s is not None for _, _, s in paired)
     if not have_split:
-        rng = random.Random(seed)
-        all_idx = list(range(len(paired)))
-        rng.shuffle(all_idx)
-        n_val = max(1, int(round(len(paired) * val_fraction)))
-        val_set = set(all_idx[:n_val])
+        val_set = assign_val([ip.stem for _, ip, _ in paired], val_fraction, seed, group_regex)
+        if val_fraction > 0 and not group_regex:
+            LOGGER.warning(
+                "random per-image split: consecutive frames of one clip can land in both train and val "
+                "(leakage). Pass --group_regex to split by clip id."
+            )
         paired = [
             (jp, ip, "val" if i in val_set else "train") for i, (jp, ip, _) in enumerate(paired)
         ]
     else:
-        # default any unknown to train
+        n_unknown = sum(1 for _, _, s in paired if s is None)
+        if n_unknown:
+            LOGGER.warning("%d files outside train/val folders default to train", n_unknown)
         paired = [(jp, ip, s or "train") for jp, ip, s in paired]
+    has_val = any(sp == "val" for _, _, sp in paired)
 
     stats = ConvertStats()
+    stats.renamed_stems = renamed
     for jp, ip, split in paired:
         try:
             _process_one(
@@ -450,6 +534,7 @@ def convert(
                 copy_images,
                 lane_thickness,
                 partial_annotation,
+                out_stem=out_stems[ip],
             )
         except Exception as e:  # pragma: no cover
             LOGGER.exception("failed on %s: %s", jp, e)
@@ -468,7 +553,7 @@ def convert(
     data_yaml = {
         "path": str(dst),
         "train": "images/train",
-        "val": "images/val",
+        "val": "images/val" if has_val else "images/train",  # no val images -> validate on train (warned)
         "nc": len(det_classes),
         "names": det_classes,
         "da_classes": len(DA_NAMES),
@@ -479,6 +564,8 @@ def convert(
     with (dst / "data.yaml").open("w", encoding="utf-8") as f:
         yaml.safe_dump(data_yaml, f, sort_keys=False)
 
+    if not has_val:
+        LOGGER.warning("no val images: data.yaml 'val' points at images/train (metrics will be optimistic)")
     LOGGER.info(
         "done: %d images, %d boxes, %d DA polys, %d LL polys, %d skipped degenerate, %d unknown-tag-parses",
         stats.images,
@@ -504,7 +591,11 @@ def build_parser(p: Optional[argparse.ArgumentParser] = None) -> argparse.Argume
         help="style: 1=solid 2=dashed; type: id per laneType value",
     )
     p.add_argument("--split_tl_by_color", action="store_true")
-    p.add_argument("--val_fraction", type=float, default=0.1)
+    p.add_argument("--val_fraction", type=float, default=0.1, help="0 disables the val split")
+    p.add_argument(
+        "--group_regex", type=str, default=None,
+        help="split whole clips: regex whose 1st group is the clip id, e.g. '^([0-9a-f]{8})-' for BDD names",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument(
         "--symlink",
@@ -513,6 +604,7 @@ def build_parser(p: Optional[argparse.ArgumentParser] = None) -> argparse.Argume
     )
     p.add_argument("--limit", type=int, default=None, help="Process at most N annotations (debug)")
     p.add_argument("--lane_thickness", type=float, default=8.0, help="lane line width in px at 720p (scaled with height)")
+    p.add_argument("--overwrite", action="store_true", help="clear an existing converted dataset in --dst first")
     p.add_argument(
         "--partial_annotation", action="store_true",
         help="do not write a DA/LL mask for images without any object of that task (trainer ignores the task)",
@@ -534,6 +626,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         limit=args.limit,
         lane_thickness=args.lane_thickness,
         partial_annotation=args.partial_annotation,
+        group_regex=args.group_regex,
+        overwrite=args.overwrite,
     )
     return 0
 
