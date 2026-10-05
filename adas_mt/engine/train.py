@@ -51,7 +51,7 @@ class MultiTaskTrainer(DetectionTrainer):
                 LOGGER.warning(f"resuming: ignoring the given multi-task config in favour of {run_cfg}")
             self.mt = MTConfig.load(run_cfg)
         else:
-            if resuming:
+            if resuming and resume is not True:  # resume=True is resolved to a path by check_resume (handled below)
                 LOGGER.warning("resuming but no <run>/mt.yaml was found: using the given/default multi-task config; "
                                "a mismatch with the original run (distillation, imgsz) will break the resume")
             self.mt = MTConfig.resolve(explicit, resume=resume)
@@ -66,11 +66,25 @@ class MultiTaskTrainer(DetectionTrainer):
             overrides.setdefault("name", "exp")
         self.teacher = None
         super().__init__(cfg, overrides, _callbacks)
+        if resuming and run_cfg is None and resume is True:
+            # Python-API `resume=True`: check_resume resolved it to the latest last.pt; that run's mt.yaml is as
+            # authoritative as for an explicit path (distillation / geometry decide the parameter groups).
+            run_cfg = MTConfig.find_run_cfg(self.args.resume)
+            if run_cfg is not None:
+                if explicit is not None:
+                    LOGGER.warning(f"resuming: ignoring the given multi-task config in favour of {run_cfg}")
+                self.mt = MTConfig.load(run_cfg)
+                self.args.imgsz = max(self.mt.imgsz)
+            else:
+                LOGGER.warning(f"resuming {self.args.resume} but no <run>/mt.yaml was found next to it: using the "
+                               "given/default multi-task config")
         if self.args.nms is not False:
             LOGGER.warning("nms is not False: validation will use the one-to-many head + NMS, not the deployed head")
         if isinstance(self.args.batch, (int, float)) and self.args.batch < 1:
-            LOGGER.warning("batch<1 (autobatch) profiles a square imgsz x imgsz input and ignores the distillation "
-                           "teacher: set batch explicitly")
+            # Ultralytics' autobatch profiles a square imgsz x imgsz input, cannot measure the backward pass of a model
+            # whose forward returns a dict (profile_ops swallows the error) and ignores the distillation teacher: the
+            # estimate is meaningless and a wrong batch is only auto-reduced 3 times in epoch 0.
+            raise ValueError(f"batch={self.args.batch}: autobatch is not supported for the multi-task model, set batch explicitly")
         if self.args.compile:
             LOGGER.warning("compile=True is not tested with the multi-task model")
         if RANK in {-1, 0} and (run_cfg is None or not (self.save_dir / "mt.yaml").exists()):

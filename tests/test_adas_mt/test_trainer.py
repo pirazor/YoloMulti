@@ -283,6 +283,61 @@ def test_cli_resume_uses_the_runs_own_mt_yaml_and_does_not_rewrite_it(tmp_path):
     assert len(rows) == 2 and float(rows[1]["train/kd_loss"]) > 0, "distillation did not continue after the CLI resume"
 
 
+def test_cli_resume_keeps_the_runs_training_args(tmp_path, monkeypatch):
+    """Ultralytics' check_resume applies batch / close_mosaic / patience / workers / cache / val / plots from the
+    overrides without a warning: the CLI must not merge default.yaml (or --cfg) back in on --resume."""
+    import adas_mt.engine as engine
+    from adas_mt.cli import main
+
+    root = _root(tmp_path)
+    t = MultiTaskTrainer(overrides=_overrides(root, epochs=2, patience=7), mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n"}))
+
+    def crash(trainer):
+        raise RuntimeError("simulated crash")
+
+    t.add_callback("on_model_save", crash)
+    with pytest.raises(RuntimeError):
+        t.train()
+    seen = {}
+
+    class Recording(engine.MultiTaskTrainer):
+        def train(self):
+            seen["args"] = self.args
+            return super().train()
+
+    monkeypatch.setattr(engine, "MultiTaskTrainer", Recording)
+    assert main(["train", "--data", str(root / "data.yaml"), "--resume", str(t.wdir / "last.pt"), "--device", "cpu"]) == 0
+    a = seen["args"]
+    # default.yaml says batch 32, close_mosaic 10, patience 30, workers 8, plots true: the run's values must survive
+    assert (a.batch, a.close_mosaic, a.patience, a.workers, a.plots, a.cache) == (4, 1, 7, 0, False, False), vars(a)
+    assert a.imgsz == max(HW) and a.optimizer == "AdamW" and a.lr0 == 0.002
+
+
+def test_python_api_resume_true_finds_the_runs_mt_yaml(tmp_path, monkeypatch):
+    root = _root(tmp_path)
+    mt = {"imgsz": list(HW), "scale": "n", "distill": {"enabled": True, "teacher": "vit_tiny_patch16_224", "teacher_pretrained": False}}
+    t = MultiTaskTrainer(overrides=_overrides(root, epochs=2), mt=MTConfig.from_dict(mt))
+
+    def crash(trainer):
+        raise RuntimeError("simulated crash")
+
+    t.add_callback("on_model_save", crash)
+    with pytest.raises(RuntimeError):
+        t.train()
+    monkeypatch.chdir(root)  # resume=True -> Ultralytics' get_latest_run() searches runs/**/last*.pt under cwd
+    r = MultiTaskTrainer(overrides=dict(resume=True, device="cpu", workers=0))
+    assert r.mt.distill.enabled and tuple(r.mt.imgsz) == HW and r.args.imgsz == max(HW)
+    before = (t.save_dir / "mt.yaml").read_text()
+    r.train()
+    assert r.model.criterion.distiller is not None and (t.save_dir / "mt.yaml").read_text() == before
+
+
+def test_autobatch_is_refused(tmp_path):
+    root = _root(tmp_path)
+    with pytest.raises(ValueError, match="autobatch"):
+        MultiTaskTrainer(overrides=_overrides(root, batch=-1), mt=MTConfig.from_dict({"imgsz": list(HW), "scale": "n"}))
+
+
 def test_cli_amp_and_cache_strings():
     import argparse
 

@@ -52,7 +52,14 @@ projector is part of the model, so it is synchronised like any other parameter. 
 `E2ELoss` one-to-many/one-to-one schedule and the distillation schedule/teacher. The run's own `<run>/mt.yaml` is
 **authoritative** on resume (multi-task flags such as `--distill` are ignored with a warning, and the file is never rewritten):
 toggling distillation or the image size would change the optimizer parameter groups and break the resume.
+The run's training arguments are restored from the checkpoint too: `--cfg` is ignored on resume and only flags given
+explicitly on the resume command line (`--batch`, `--workers`, `--device`, ...) replace them (Ultralytics applies
+`batch`, `close_mosaic`, `patience`, `workers`, `cache`, `val`, `plots` overrides on resume without a warning, so the
+CLI no longer merges `default.yaml` back in). `batch: -1` (autobatch) is refused: it profiles a square input and
+cannot measure the backward pass of this model.
 A clean stop strips `last.pt` (Ultralytics behaviour); only a crash/kill leaves it resumable.
+Do not set `ULTRALYTICS_SAFE_LOAD=1` in the training image: it refuses to unpickle any model class that is not
+Ultralytics' own, including `MultiTaskModel` checkpoints.
 
 ## Precision notes
 * With `amp: true` Ultralytics validates in fp16 (also when training with `amp: bf16`): that matches the FP16 TensorRT deployment, so a

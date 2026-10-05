@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import base64
 import json
 import logging
 import random
 import shutil
+import zlib
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -84,6 +86,8 @@ class ConvertStats:
     skipped_unknown_class: Counter = field(default_factory=Counter)
     skipped_tag_parse: int = 0
     skipped_unmapped: int = 0  # DA/lane objects whose attribute value has no class id
+    skipped_geometry: Counter = field(default_factory=Counter)  # "<classTitle>/<geometryType>" the converter cannot draw
+    size_mismatch: int = 0  # annotations whose `size` differs from the image file (coordinates were scaled)
     renamed_stems: int = 0  # output names disambiguated because two images share a stem
 
 
@@ -197,9 +201,61 @@ def _draw_polygon(mask: np.ndarray, exterior, interior, value: int) -> None:
     mask[tmp == 1] = value
 
 
-def _line_thickness(image_h: int, ref_px: float = 8.0) -> int:
-    """Lane line thickness: ``ref_px`` at 720p, scaled with image height (min 2 px)."""
-    return max(2, int(round(ref_px * image_h / 720)))
+def _line_thickness(image_hw: Tuple[int, int], ref_px: float = 8.0) -> int:
+    """Lane line thickness: ``ref_px`` for a 1280 px long side, scaled with the long side (min 2 px).
+
+    The trainer scales the LONG side to the training width, so this keeps the drawn lane ~ref_px/2 px wide at 640
+    whatever the aspect ratio (scaling with the height alone gave 4:3 sources 1.5x thicker lanes)."""
+    return max(2, int(round(ref_px * max(image_hw) / 1280)))
+
+
+def _image_size(path: Path) -> Optional[Tuple[int, int]]:
+    """(h, w) from the image header without decoding the pixels; None when unreadable."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            return int(im.size[1]), int(im.size[0])
+    except (OSError, ValueError):
+        return None
+
+
+def _decode_bitmap(obj: dict) -> Optional[Tuple[np.ndarray, Tuple[int, int]]]:
+    """Supervisely ``bitmap`` geometry: base64 of a (zlib-compressed) PNG plus ``origin`` [x, y] in the image.
+
+    Returns ``(bool mask, (ox, oy))`` or None when the object carries no usable bitmap."""
+    bm = obj.get("bitmap") or {}
+    data, origin = bm.get("data"), bm.get("origin")
+    if not data or not origin or len(origin) != 2:
+        return None
+    try:
+        raw = base64.b64decode(data)
+        try:
+            raw = zlib.decompress(raw)  # the Supervisely SDK compresses the PNG; some exports do not
+        except zlib.error:
+            pass
+        arr = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
+    except (ValueError, cv2.error):
+        return None
+    if arr is None:
+        return None
+    if arr.ndim == 3:
+        arr = arr[..., 3] if arr.shape[2] == 4 else arr[..., 0]  # RGBA: the alpha plane is the mask
+    return arr.astype(bool), (int(origin[0]), int(origin[1]))
+
+
+def _paste_bitmap(mask: np.ndarray, bm: np.ndarray, origin: Tuple[int, int], value: int, sx: float, sy: float) -> None:
+    """Write ``value`` where the bitmap is set, placed at ``origin`` (scaled by sx/sy, clipped to the image)."""
+    if sx != 1.0 or sy != 1.0:
+        bm = cv2.resize(bm.astype(np.uint8), (max(1, int(round(bm.shape[1] * sx))), max(1, int(round(bm.shape[0] * sy)))),
+                        interpolation=cv2.INTER_NEAREST).astype(bool)
+    ox, oy = int(round(origin[0] * sx)), int(round(origin[1] * sy))
+    h, w = mask.shape[:2]
+    x0, y0, x1, y1 = max(ox, 0), max(oy, 0), min(ox + bm.shape[1], w), min(oy + bm.shape[0], h)
+    if x1 <= x0 or y1 <= y0:
+        return
+    region = mask[y0:y1, x0:x1]
+    region[bm[y0 - oy : y1 - oy, x0 - ox : x1 - ox]] = value
 
 
 def _split_for_path(p: Path, src_root: Path) -> Optional[str]:
@@ -310,19 +366,33 @@ def _process_one(
     size = ann.get("size") or {}
     h = int(size.get("height", 0))
     w = int(size.get("width", 0))
+    real = _image_size(img_path)  # header only; the JSON `size` is never trusted blindly
+    if real is None:
+        LOGGER.warning("cannot read %s; skipping", img_path)
+        return
     if not (h and w):
-        # fall back to image read
-        im = cv2.imread(str(img_path))
-        if im is None:
-            LOGGER.warning("cannot read %s; skipping", img_path)
-            return
-        h, w = im.shape[:2]
+        h, w = real
+    sx = sy = 1.0
+    if (h, w) != real:
+        # Supervisely coordinates live in the frame of `size`; an image that was resized afterwards would otherwise
+        # get misplaced masks and mis-normalised boxes in silence. Scale into the real frame and say so.
+        stats.size_mismatch += 1
+        LOGGER.warning("%s: annotation size %dx%d but the image is %dx%d: scaling the coordinates", json_path.name, w, h,
+                       real[1], real[0])
+        sx, sy = real[1] / w, real[0] / h
+        h, w = real
+
+    def scaled(points) -> np.ndarray:
+        return np.asarray(points, dtype=np.float64).reshape(-1, 2) * (sx, sy)
+
+    def ipts(points) -> np.ndarray:
+        return np.rint(scaled(points)).astype(np.int32)
 
     stem = out_stem or img_path.stem
     det_lines: List[str] = []
     da_mask = np.zeros((h, w), dtype=np.uint8)
     ll_mask = np.zeros((h, w), dtype=np.uint8)
-    line_thick = _line_thickness(h, lane_thickness)
+    line_thick = _line_thickness((h, w), lane_thickness)
     da_seen = ll_seen = False
 
     for obj in ann.get("objects", []):
@@ -331,18 +401,19 @@ def _process_one(
             continue
         gtype = (obj.get("geometryType") or "").strip()
         ext = (obj.get("points") or {}).get("exterior") or []
-        holes = (obj.get("points") or {}).get("interior") or []
+        holes = [ipts(ring) for ring in ((obj.get("points") or {}).get("interior") or [])]
         attrs = _parse_tags(obj.get("tags"), stats)
+        is_da, is_lane = title.lower() == "drivable area", title.lower() == "lane"
 
         if gtype == "rectangle":
             class_name = _det_class_name(title, attrs, split_tl_by_color)
             if class_name is None or class_name not in det_class_to_id:
-                if class_name is None and title.lower() not in {"drivable area", "lane"}:
+                if class_name is None and not (is_da or is_lane):
                     stats.skipped_unknown_class[title] += 1
                 continue
             if len(ext) != 2:
                 continue
-            (x1, y1), (x2, y2) = ext[0], ext[1]
+            (x1, y1), (x2, y2) = scaled(ext).tolist()
             yolo = _xyxy_to_yolo(float(x1), float(y1), float(x2), float(y2), w, h)
             if yolo is None:
                 stats.skipped_degenerate += 1
@@ -352,47 +423,57 @@ def _process_one(
             det_lines.append(f"{cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
             stats.boxes += 1
 
-        elif title.lower() == "drivable area" and gtype == "polygon":
-            pts = np.asarray(ext, dtype=np.int32)
-            if _is_degenerate_polygon(pts):
-                stats.skipped_degenerate += 1
-                continue
+        elif is_da and gtype in {"polygon", "bitmap"}:
             value = DA_VALUE_MAP.get(attrs.get("areaType", "").lower(), 0)
             if value == 0:  # unmapped areaType: do not count the task as annotated for this image
                 stats.skipped_unmapped += 1
                 continue
-            try:
-                _draw_polygon(da_mask, pts, holes, value)
-                da_seen = True
-                stats.da_polys += 1
-            except cv2.error as e:  # pragma: no cover - defensive
-                LOGGER.warning("DA fillPoly failed on %s: %s", json_path.name, e)
-
-        elif title.lower() == "lane":
-            if gtype == "polygon":
-                pts = np.asarray(ext, dtype=np.int32)
+            if gtype == "bitmap":
+                decoded = _decode_bitmap(obj)
+                if decoded is None:
+                    stats.skipped_degenerate += 1
+                    continue
+                _paste_bitmap(da_mask, decoded[0], decoded[1], value, sx, sy)
+            else:
+                pts = ipts(ext)
                 if _is_degenerate_polygon(pts):
                     stats.skipped_degenerate += 1
                     continue
-                cls_id = _resolve_lane_class_id(attrs, lane_grouping, type_to_id)
-                if cls_id == 0:
-                    stats.skipped_unmapped += 1
+                try:
+                    _draw_polygon(da_mask, pts, holes, value)
+                except cv2.error as e:  # pragma: no cover - defensive
+                    LOGGER.warning("DA fillPoly failed on %s: %s", json_path.name, e)
+                    continue
+            da_seen = True
+            stats.da_polys += 1
+
+        elif is_lane and gtype in {"polygon", "line", "bitmap"}:
+            cls_id = _resolve_lane_class_id(attrs, lane_grouping, type_to_id)
+            if cls_id == 0:
+                stats.skipped_unmapped += 1
+                continue
+            if gtype == "polygon":
+                pts = ipts(ext)
+                if _is_degenerate_polygon(pts):
+                    stats.skipped_degenerate += 1
                     continue
                 _draw_polygon(ll_mask, pts, holes, cls_id)
-                ll_seen = True
-                stats.ll_polys += 1
             elif gtype == "line":
                 if len(ext) < 2:
                     stats.skipped_degenerate += 1
                     continue
-                pts = np.asarray(ext, dtype=np.int32).reshape(-1, 1, 2)
-                cls_id = _resolve_lane_class_id(attrs, lane_grouping, type_to_id)
-                if cls_id == 0:
-                    stats.skipped_unmapped += 1
+                cv2.polylines(ll_mask, [ipts(ext).reshape(-1, 1, 2)], isClosed=False, color=cls_id, thickness=line_thick)
+            else:
+                decoded = _decode_bitmap(obj)
+                if decoded is None:
+                    stats.skipped_degenerate += 1
                     continue
-                cv2.polylines(ll_mask, [pts], isClosed=False, color=cls_id, thickness=line_thick)
-                ll_seen = True
-                stats.ll_polys += 1
+                _paste_bitmap(ll_mask, decoded[0], decoded[1], cls_id, sx, sy)
+            ll_seen = True
+            stats.ll_polys += 1
+
+        else:  # a geometry this converter cannot draw (e.g. a 'car' polygon, a DA 'point'): never silently dropped
+            stats.skipped_geometry[f"{title}/{gtype or '?'}"] += 1
 
     # Write outputs ----------------------------------------------------------------
     img_out = out_dirs["images"] / split / f"{stem}.jpg"
@@ -577,6 +658,10 @@ def convert(
     )
     if stats.skipped_unknown_class:
         LOGGER.info("unknown classTitles skipped: %s", dict(stats.skipped_unknown_class))
+    if stats.skipped_geometry:
+        LOGGER.warning("objects with a geometry this converter cannot draw were skipped: %s", dict(stats.skipped_geometry))
+    if stats.size_mismatch:
+        LOGGER.warning("%d annotations had a `size` different from their image file: coordinates were scaled", stats.size_mismatch)
     return stats
 
 

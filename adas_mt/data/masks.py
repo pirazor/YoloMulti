@@ -57,7 +57,7 @@ def pack_masks(
             return np.full((h, w), n, dtype=np.uint8)
         if m.shape[:2] != (h, w):
             raise ValueError(f"mask shape {m.shape[:2]} != {(h, w)}")
-        return np.where(m < n, m, n).astype(np.uint8)  # out-of-range -> unlabelled code
+        return np.minimum(m, n).astype(np.uint8, copy=False)  # out-of-range (incl. 255) -> unlabelled code n
 
     k = code_base(da_classes)
     return (codes(da, da_classes) + k * codes(ll, ll_classes)).astype(np.uint8)

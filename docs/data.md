@@ -10,7 +10,16 @@ root/data.yaml                         nc, names, da_classes, da_names, ll_class
 ```
 **A missing DA/LL PNG means "not annotated", not "background".** Use `--partial_annotation`
 when some images were annotated for only one task; the loss then ignores that task for them.
-`--lane_thickness` is the lane line width in px at 720p (default 8, scaled with image height).
+`--lane_thickness` is the lane line width in px for a 1280 px long side (default 8, scaled with the long side, which
+is how the trainer scales the image, so lanes are ~4 px wide at 640 whatever the aspect ratio).
+
+Masks from other tools: the PNG must hold class ids (0 = background, 1..N-1, 255 = ignore). 8-bit grayscale, palette,
+1-bit and 16-bit PNGs are decoded as ids (a palette PNG is **not** turned into colours); RGB masks are refused. When
+the dataset is built it counts the masks of each task per split and validates a sample of them: a split whose images
+have no `labels_da` / `labels_ll` PNG at all raises (almost always a misnamed directory or a wrong `path:`), unless
+`data.yaml` lists the task under `optional_masks: [da]` / `[ll]`; ids outside `0..classes-1` raise (they would train
+as "unlabelled"), and a 0/255 binary mask is reported because 255 means ignore. Supervisely `bitmap` objects are
+decoded by the converter; objects with another geometry are counted under "skipped" instead of vanishing.
 
 ## Converter safety
 - Re-running into a folder that already holds a converted dataset raises unless `--overwrite` (a second run with a
@@ -46,6 +55,16 @@ ignored; the Phase 4 loss uses `ignore_index=255`.
 Training: `RectMosaic` (2h x 2w canvas) -> `RandomPerspective(size=(w, h))` crops the central
 window at native scale -> HSV -> flip. Validation: centred `LetterBox` with 255 mask padding.
 Use `build(..., hsv_h<=0.015, degrees<=3)` for ADAS-safe augmentation (keeps traffic-light colours).
+
+## Loading cost and caching
+Decoding the two 720p mask PNGs and packing them costs more than the JPEG itself (~35 ms vs ~25 ms per image on one
+core), and a mosaic sample needs four images while Ultralytics serves three of them from its RAM buffer. The dataset
+therefore packs at the loaded image size (4x fewer pixels for 720p -> 384x640, identical result), keeps the packed masks
+of the buffered images in RAM with the same eviction as the images, and with `cache: ram` caches every packed mask of
+the split in the same shared tensor type Ultralytics uses for the images (dataloader workers do not duplicate it; the
+RAM check requires a third more than the images). Measured on 1280x720 data at 384x640: 109 -> 39 ms per mosaic
+sample on one core, so 8 workers feed roughly 200 samples/s. `cache: disk` caches only the images (as `.npy`); the
+masks then go through the buffer cache like the uncached case.
 
 ## Tests
 `pytest tests/test_adas_mt` builds a synthetic set whose red/green rectangles are simultaneously
