@@ -82,3 +82,21 @@ its source. They are the contract between `adas_mt` and the trainer.
     the sidecar JSON and torch for CUDA buffers.
 35. **Still unverified (needs the Orin):** TensorRT acceptance of `DepthToSpace(CRD)` (`--decompose-pixel-shuffle` is the tested fallback), real
     FP16/INT8 accuracy and latency, GStreamer camera input.
+
+## Found by the independent review of Phase 5 (verified against upstream Ultralytics' TensorRT code or by running; all fixed, each with a test)
+36. **`builder.platform_has_fast_fp16` was removed in TensorRT 10** (Ultralytics reads it with a default): the default FP16 build would have raised on
+    JetPack 6.2/7.2. The fake `tensorrt` now has no such attribute on 10.
+37. **`set_calibration_profile` is deprecated on TensorRT 10 and causes internal errors** (Ultralytics only calls it before 10): it is now guarded the same way.
+38. **TensorRT 10.3.0 (JetPack 6.x) cannot build INT8 engines for NMS-free heads** (Ultralytics issue 23841). `trt-build` warns; `export --det-head raw`
+    ends the graph at the dense one-to-one predictions (no TopK / GatherElements / Mod) and the runner / evaluator do the top-k in numpy
+    (`deploy/postprocess.py`, equal to `Detect.get_topk_index`, tested against the real implementation). Unverified on the device.
+39. **Grouped top-k:** Ultralytics' own TensorRT export uses a grouped exact top-k (`Detect.format='engine'`); the default export now does too
+    (`--no-trt-topk` to disable). The Detect head attributes are restored after every export, also on failure.
+40. **Detection parity at export** (found while adding the reviewer's missing real-frame test) compared rows pairwise after a sort: fragile when anchors tie at
+    the first top-k stage (random-init and ill-conditioned models). It now checks that every confident exported detection exists in PyTorch's dense predictions and that the best scores and the confident count agree.
+41. **Runner / builder robustness:** the TensorRT logger and runtime are kept alive for the engine's lifetime; a non-CUDA device is refused (a real engine would
+    get CPU pointers); `eval` defaults to the GPU for engines; FP16 pinning skips layers that produce network outputs or have integer inputs; a rejected
+    optimisation profile and a foreign timing cache no longer lose the engine or its sidecar; `--keep-fp16` lists accept presets.
+42. **Evaluation / IO:** a short last batch against a static-batch-N graph is padded (it failed before); `predict` keeps the source fps and resizes frames that
+    change size mid-stream (the writer silently dropped them); `bench --gpu-preprocess` synchronises before timing the letterbox; `det` is declared as
+    `(B, min(max_det, anchors), 6)`; reading an ONNX without sidecar and without the `onnx` package explains what to copy.

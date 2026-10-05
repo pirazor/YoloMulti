@@ -139,18 +139,22 @@ def _input_shape(network) -> tuple[str, tuple]:
 
 
 def _pin_fp16(trt, network, config, substrings: Sequence[str]) -> int:
-    """Force the floating-point layers whose name contains one of ``substrings`` to FP16.
+    """Force the interior floating-point layers whose name contains one of ``substrings`` to FP16.
 
-    Layers with an integer output (TopK indices, Shape, Gather, Cast ...) and constants are left alone: forcing
-    a float type on them is invalid."""
+    Left alone, because forcing a float type there is invalid or changes the declared interface: constants; layers with
+    an integer input or output (TopK indices, Shape, Gather, Cast ...); and the layers that produce a network output
+    (the outputs keep their declared dtype)."""
     float_types = (trt.float32, trt.float16)
     constant = getattr(getattr(trt, "LayerType", None), "CONSTANT", None)
+    outputs = {network.get_output(i).name for i in range(network.num_outputs)}
     n = 0
     for i in range(network.num_layers):
         layer = network.get_layer(i)
         if not any(s in layer.name for s in substrings) or (constant is not None and layer.type == constant):
             continue
-        if not all(layer.get_output(j).dtype in float_types for j in range(layer.num_outputs)):
+        outs = [layer.get_output(j) for j in range(layer.num_outputs)]
+        ins = [t for t in (layer.get_input(j) for j in range(layer.num_inputs)) if t is not None]
+        if any(t.name in outputs for t in outs) or not all(t.dtype in float_types for t in outs + ins):
             continue
         layer.precision = trt.float16
         for j in range(layer.num_outputs):
@@ -160,6 +164,17 @@ def _pin_fp16(trt, network, config, substrings: Sequence[str]) -> int:
         flag = getattr(trt.BuilderFlag, "OBEY_PRECISION_CONSTRAINTS", None) or getattr(trt.BuilderFlag, "PREFER_PRECISION_CONSTRAINTS")
         config.set_flag(flag)
     return n
+
+
+def resolve_keep_fp16(keep_fp16: str | Sequence[str], meta: dict) -> List[str]:
+    """``heads`` / ``seg`` / ``none`` presets, component aliases (``det`` ``da`` ``ll``) and raw node-name substrings
+    (any mix, as a string or a list) -> the node-name substrings to pin."""
+    items = [keep_fp16] if isinstance(keep_fp16, str) else list(keep_fp16)
+    comps: List[str] = []
+    for it in items:
+        comps += list(KEEP_FP16_PRESETS[it]) if it in KEEP_FP16_PRESETS else [it]
+    layers = meta.get("layers", {})
+    return [layers.get(c, c) for c in comps]
 
 
 def build_engine(
@@ -216,7 +231,8 @@ def build_engine(
         config.builder_optimization_level = int(optimization_level)
 
     if precision in ("fp16", "int8"):
-        if not builder.platform_has_fast_fp16:
+        # removed from the Builder in TensorRT 10 (Ultralytics reads it with a default too)
+        if not getattr(builder, "platform_has_fast_fp16", True):
             LOG.warning("this GPU reports no fast FP16; the engine will still build")
         config.set_flag(trt.BuilderFlag.FP16)  # int8 builds fall back to FP16, not FP32, for unsupported layers
 
@@ -228,9 +244,12 @@ def build_engine(
         h, w = int(in_shape[2]), int(in_shape[3])
         mn, op = 1, int(opt_batch or 1)
         mx = int(max_batch or max(4, op))
+        if not mn <= op <= mx:
+            raise TrtBuildError(f"need 1 <= opt_batch <= max_batch, got opt_batch={op}, max_batch={mx}")
         profile = builder.create_optimization_profile()
         profile.set_shape(in_name, (mn, 3, h, w), (op, 3, h, w), (mx, 3, h, w))
-        config.add_optimization_profile(profile)
+        if config.add_optimization_profile(profile) < 0:  # -1 = the profile is invalid for this network
+            raise TrtBuildError(f"TensorRT rejected the optimisation profile (batch {mn}/{op}/{mx}, input {h}x{w})")
 
     pinned = 0
     if precision == "int8":
@@ -242,14 +261,18 @@ def build_engine(
         # a calibration cache is only reused when asked for: scales are keyed by tensor name, so a stale one
         # (same name, different weights) would silently give a wrong INT8 engine
         calibrator = make_calibrator(trt, images, net_hw, cal_batch, Path(calib_cache) if calib_cache else None, calib_device)
-        if profile is not None and hasattr(config, "set_calibration_profile"):
+        if profile is not None and major < 10:  # deprecated in TensorRT 10, where it causes internal errors (as Ultralytics)
             config.set_calibration_profile(profile)
         config.int8_calibrator = calibrator
-        subs = KEEP_FP16_PRESETS[keep_fp16] if isinstance(keep_fp16, str) and keep_fp16 in KEEP_FP16_PRESETS else keep_fp16
-        if isinstance(subs, str):
-            subs = [subs]
-        subs = [meta.get("layers", {}).get(s, s) for s in subs]  # component alias -> node-name substring
+        subs = resolve_keep_fp16(keep_fp16, meta)
         pinned = _pin_fp16(trt, network, config, subs) if subs else 0
+        if subs and not pinned:
+            LOG.warning("--keep-fp16 %s matched no layer; the heads will be quantised", list(subs))
+        if str(trt.__version__).startswith("10.3") and meta.get("det_head", "topk") != "raw":
+            LOG.warning(
+                "TensorRT 10.3.x (JetPack 6.x) is reported to fail building INT8 engines for NMS-free heads "
+                "('region should have been removed from Graph::regions', Ultralytics issue 23841). If the build "
+                "asserts: re-export with --det-head raw (top-k on the host), build FP16, or use a newer TensorRT.")
         LOG.info("INT8: %d calibration images, %d layers pinned to FP16 (%s)", len(images), pinned, list(subs))
 
     if timing_cache:
@@ -263,8 +286,6 @@ def build_engine(
         raise TrtBuildError("TensorRT returned no engine; re-run with --verbose to see the failing layer")
     engine.parent.mkdir(parents=True, exist_ok=True)
     engine.write_bytes(bytes(serialized))
-    if timing_cache:
-        Path(timing_cache).write_bytes(bytes(config.get_timing_cache().serialize()))
 
     info = {
         "precision": precision, "tensorrt": str(trt.__version__), "workspace_mb": int(workspace_mb), "onnx": onnx.name,
@@ -274,13 +295,26 @@ def build_engine(
     }
     meta_file = meta_path(engine)
     meta_file.write_text(json.dumps({**meta, "engine": info}, indent=2), encoding="utf-8")
+    if timing_cache:  # best effort, after the engine and its metadata are safely written
+        try:
+            Path(timing_cache).write_bytes(bytes(config.get_timing_cache().serialize()))
+        except Exception as e:  # noqa: BLE001
+            LOG.warning("could not save the timing cache %s (%s: %s)", timing_cache, type(e).__name__, e)
     secs = time.time() - t0
     LOG.info("wrote %s (%.1f MB) in %.0f s", engine, engine.stat().st_size / 1e6, secs)
     return BuildResult(engine, meta_file, secs, info)
 
 
-def trtexec_command(onnx: str | Path, engine: str | Path, precision: str = "fp16", workspace_mb: int = 1024) -> str:
-    """The equivalent ``trtexec`` line (for reproducing a build or timing an engine without the python API)."""
+def trtexec_command(onnx: str | Path, engine: str | Path, precision: str = "fp16", workspace_mb: int = 1024,
+                    calib_cache: str | Path | None = None) -> str:
+    """The ``trtexec`` line that reproduces a build. INT8 needs the calibration cache (``--calib-cache``) to be
+    meaningful; without one trtexec uses dummy scales, which is only good for timing."""
     flag = {"fp32": "", "fp16": " --fp16", "int8": " --fp16 --int8"}[precision]
-    return (f"trtexec --onnx={onnx} --saveEngine={engine}{flag} --memPoolSize=workspace:{workspace_mb}M "
-            f"--useCudaGraph --noDataTransfers --warmUp=500 --iterations=1000 --avgRuns=100")
+    if precision == "int8" and calib_cache:
+        flag += f" --calib={calib_cache}"
+    return f"trtexec --onnx={onnx} --saveEngine={engine}{flag} --memPoolSize=workspace:{workspace_mb}M"
+
+
+def trtexec_timing_command(engine: str | Path) -> str:
+    """Time a finished engine on the GPU only (no host copies), the reference for the ``infer`` stage of ``bench``."""
+    return f"trtexec --loadEngine={engine} --useCudaGraph --noDataTransfers --warmUp=500 --iterations=1000 --avgRuns=100"

@@ -100,13 +100,15 @@ def tiny_supervisely(tmp_path):
     return tmp_path / "ds"
 
 
-def nontrivial_model(scale: str = "n", nc: int = 3, imgsz=(96, 160), seed: int = 0, det_bias: float = 3.0):
+def nontrivial_model(scale: str = "n", nc: int = 3, imgsz=(96, 160), seed: int = 0, det_bias: float = 3.0, calib=None):
     """A random-init model that behaves like a trained one for export/parity tests.
 
     A random-init YOLO in eval mode has vanishing activations, so every output is just a bias and every
     anchor ties (the tests would then compare arbitrary top-k picks). Training-mode batch statistics are
     copied into the BatchNorm running stats (momentum 1) so activations are normalised layer by layer, and the
-    detection class biases are raised so some scores are confident."""
+    detection class biases are raised so some scores are confident. ``calib``: (N, 3, H, W) images in [0, 1] for the
+    BatchNorm calibration instead of smooth random ones (a model calibrated on its own data domain has well-conditioned
+    activations on it, like a trained one; on out-of-domain frames fp32 drift is amplified)."""
     import torch
     import torch.nn as nn
     import torch.nn.functional as F
@@ -122,11 +124,14 @@ def nontrivial_model(scale: str = "n", nc: int = 3, imgsz=(96, 160), seed: int =
     model.train()
     g = torch.Generator().manual_seed(seed)
     x = F.interpolate(torch.rand(8, 3, 6, 10, generator=g), size=tuple(imgsz), mode="bilinear", align_corners=False)
+    if calib is not None:
+        x = calib
     with torch.no_grad():
         model(x)
         for branch in (model.model[-1].one2one_cv3, model.model[-1].cv3):
             for seq in branch:
                 seq[-1].bias.add_(det_bias)
+        model.ll_head.cls.bias.zero_()  # drop the 99%-background prior: lane classes must appear in parity checks
     for b in bns:
         b.momentum = 0.1
     return model.eval()

@@ -3,7 +3,7 @@
 Detection + drivable area (direct / alternative) + lane (solid / dashed) from one
 YOLO26-based CNN, trained with dense foundation-model distillation (training-time
 only) and deployed as a TensorRT FP16/INT8 engine with NMS-free detection and
-uint8 class-map outputs.
+in-graph class-map outputs (int32, or uint8 on TensorRT >= 10).
 
 Status: **v0.2**. Phases 0-5 are implemented: re-platform, [data](docs/data.md), [model](docs/architecture.md), [distillation](docs/distillation.md), [trainer / validator](docs/training.md) and [export / Jetson deployment](docs/deployment_jetson.md). Everything that can be verified on a CPU is tested; the TensorRT engine build, its accuracy and the latency on the Orin are **not yet measured** (commands and a results table are in the deployment doc).
 The previous YOLOv13-based implementation lives in [`legacy/yolov13/`](legacy/yolov13/)

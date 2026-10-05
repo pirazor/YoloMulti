@@ -15,10 +15,12 @@ only) or ``logits`` (float32 (B, C, H, W), for debugging and calibration studies
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import time
 import warnings
+from contextlib import contextmanager
 from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -34,6 +36,7 @@ from adas_mt.deploy.meta import meta_path, read_meta  # noqa: F401  (re-exported
 LOG = logging.getLogger("adas_mt.export")
 
 SEG_DTYPES = ("int32", "uint8", "logits")
+DET_HEADS = ("topk", "raw")
 INPUT_NAME = "images"
 OUTPUT_NAMES = ("det", "da", "ll")
 META_VERSION = 1
@@ -91,6 +94,46 @@ class DeployWrapper(nn.Module):
         det = out["det"]
         det = det[0] if isinstance(det, (tuple, list)) else det
         return det, self._seg(out["da"]), self._seg(out["ll"])
+
+
+_MISSING = object()
+
+
+@contextmanager
+def _head_mode(det: nn.Module, det_head: str, trt_topk: bool, raw: bool | None = None):
+    """Configure ``Detect`` for tracing and restore every attribute afterwards (instance or inherited).
+
+    * ``export=True``: ``Detect.forward`` returns the decoded tensor instead of ``(y, raw_dict)``.
+    * ``format='engine'``: Ultralytics' own TensorRT export uses a *grouped, exact* top-k (smaller TopK layers, which are
+      much cheaper in TensorRT than one TopK over every anchor x class); same result, different graph.
+    * ``det_head='raw'``: ``postprocess`` becomes the identity, so the graph ends at the dense one-to-one predictions
+      ``(B, A, 4 + nc)`` and the top-k happens on the host (:mod:`adas_mt.deploy.postprocess`).
+    ``raw`` overrides the raw/topk choice for a temporary re-entry (the parity check needs both)."""
+    keys = ("export", "format", "postprocess")
+    saved = {k: det.__dict__.get(k, _MISSING) for k in keys}
+    det.export = True
+    det.format = "engine" if trt_topk else None
+    if (det_head == "raw") if raw is None else raw:
+        det.postprocess = lambda preds: preds
+    else:
+        det.__dict__.pop("postprocess", None)
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is _MISSING:
+                det.__dict__.pop(k, None)
+            else:
+                det.__dict__[k] = v
+
+
+def det_output_shape(det: nn.Module, imgsz, det_head: str, batch) -> list:
+    """Declared shape of the ``det`` output: ``(B, min(max_det, anchors), 6)`` or the dense ``(B, anchors, 4 + nc)``."""
+    h, w = imgsz
+    anchors = int(sum((h // int(s)) * (w // int(s)) for s in det.stride))  # imgsz is a multiple of 32
+    if det_head == "raw":
+        return [batch, anchors, 4 + int(det.nc)]
+    return [batch, min(int(det.max_det), anchors), 6]
 
 
 # --------------------------------------------------------------------------- model loading
@@ -157,7 +200,7 @@ def _names(d: Any) -> list:
 
 
 def build_meta(model: nn.Module, imgsz, batch: int, dynamic: bool, opset: int, seg_dtype: str, source: str,
-               decompose_pixel_shuffle: bool) -> Dict[str, Any]:
+               decompose_pixel_shuffle: bool, det_head: str = "topk", trt_topk: bool = True) -> Dict[str, Any]:
     import ultralytics
 
     det = model.model[-1]
@@ -169,6 +212,7 @@ def build_meta(model: nn.Module, imgsz, batch: int, dynamic: bool, opset: int, s
         "source": str(source),
         "imgsz": [h, w], "batch": batch, "dynamic_batch": bool(dynamic), "opset": opset,
         "seg_dtype": seg_dtype, "decompose_pixel_shuffle": bool(decompose_pixel_shuffle),
+        "det_head": det_head, "topk_groups": 8 if (trt_topk and det_head == "topk") else 1,
         "max_det": int(det.max_det), "nc": int(det.nc),
         "names": _names(model.names), "da_names": list(model.da_names), "ll_names": list(model.ll_names),
         "da_classes": int(model.da_classes), "ll_classes": int(model.ll_classes),
@@ -180,8 +224,10 @@ def build_meta(model: nn.Module, imgsz, batch: int, dynamic: bool, opset: int, s
             "pad": "centred letterbox, value 114", "equals": "validation pipeline (tests/test_adas_mt/test_deploy_preprocess.py)",
         },
         "outputs": {
-            "det": {"shape": [b, int(det.max_det), 6], "dtype": "float32",
-                    "columns": "x1 y1 x2 y2 score class, network pixels, NMS-free (one-to-one head)"},
+            "det": {"shape": det_output_shape(det, imgsz, det_head, b), "dtype": "float32",
+                    "columns": ("x1 y1 x2 y2 score class, network pixels, NMS-free (one-to-one head)" if det_head == "topk" else
+                                "dense one-to-one predictions: x1 y1 x2 y2 (network pixels) + per-class sigmoid scores; "
+                                "top-k on the host (adas_mt.deploy.postprocess.topk_det)")},
             "da": {"shape": seg_shape, "dtype": "float32" if seg_dtype == "logits" else seg_dtype},
             "ll": {"shape": seg_shape, "dtype": "float32" if seg_dtype == "logits" else seg_dtype},
         },
@@ -211,56 +257,82 @@ def _smooth_random(batch: int, imgsz) -> torch.Tensor:
     return F.interpolate(low, size=tuple(imgsz), mode="bilinear", align_corners=False)
 
 
-def _det_parity(got: np.ndarray, want: np.ndarray, conf: float = 0.05) -> Dict[str, float]:
-    """Tie-robust comparison of two (B, N, 6) detection tensors.
+def _box_tol(dense: np.ndarray) -> float:
+    """Box agreement in pixels: 0.1 px plus a relative term (fp32 drift over ~100 fused layers is ~1e-5 relative)."""
+    return 0.1 + 5e-5 * float(np.abs(dense[..., :4]).max())
 
-    Top-k breaks exact (and, across runtimes, near-exact) score ties arbitrarily, so row ``i`` of one tensor need not
-    be row ``i`` of the other. What must agree: the sorted score vector, and the confident rows (``score > conf`` and
-    strictly above the top-k cutoff) after a canonical sort."""
+
+def _det_check(got: np.ndarray, dense: np.ndarray, want: np.ndarray, conf: float = 0.05) -> Dict[str, float]:
+    """Compare the exported detections ``got`` (B, k, 6) with PyTorch's: ``dense`` (B, A, 4 + nc) are PyTorch's one-to-one
+    predictions before the top-k, ``want`` (B, k, 6) its top-k.
+
+    Row order and the pick among tied scores are runtime-dependent (top-k ties, and anchors whose best score ties at the
+    first selection stage), so rows are not compared pairwise. What must hold:
+
+    1. every confident exported row exists in PyTorch's dense predictions: same class, score within 1e-3, box within a
+       few hundredths of a pixel. A wrong weight, op, stride or coordinate bug fails here;
+    2. the best scores agree (the top rows are far from any tie) and the number of confident rows agrees up to 5%."""
     stats = {"det_score_max_abs": 0.0, "det_box_max_abs": 0.0, "det_confident": 0.0}
-    for g, w in zip(got, want):
-        sg, sw = np.sort(g[:, 4])[::-1], np.sort(w[:, 4])[::-1]
-        stats["det_score_max_abs"] = max(stats["det_score_max_abs"], float(np.abs(sg - sw).max()))
-        # rows at the top-k cutoff are an arbitrary pick among tied scores: only rows strictly above it are comparable
-        floor = max(conf, float(max(g[:, 4].min(), w[:, 4].min())) + 1e-4)
-        gc, wc = g[g[:, 4] > floor], w[w[:, 4] > floor]
-        if len(gc) != len(wc):
-            # a score within float noise of the threshold may fall on either side: allow a one-row slack
-            if abs(len(gc) - len(wc)) > 1:
-                raise ExportParityError(f"{len(gc)} confident detections in ONNX vs {len(wc)} in PyTorch")
-            continue
-        order = lambda a: np.lexsort((a[:, 3], a[:, 2], a[:, 1], a[:, 0], a[:, 5], -a[:, 4]))  # noqa: E731
-        gc, wc = gc[order(gc)], wc[order(wc)]
-        if len(gc):
-            stats["det_box_max_abs"] = max(stats["det_box_max_abs"], float(np.abs(gc[:, :4] - wc[:, :4]).max()))
-            if not (gc[:, 5] == wc[:, 5]).all():
-                raise ExportParityError("class ids of the confident detections differ between ONNX and PyTorch")
-        stats["det_confident"] += len(gc)
+    for g, d, w in zip(got, dense, want):
+        tol = _box_tol(d)
+        rows = g[g[:, 4] > conf]
+        for row in rows:
+            cls = int(row[5])
+            cand = np.abs(d[:, 4 + cls] - row[4]) <= 1e-3
+            if not cand.any():
+                raise ExportParityError(f"exported detection (class {cls}, score {row[4]:.4f}) matches no PyTorch prediction: "
+                                        "class ids or scores differ from PyTorch")
+            nearest = float(np.abs(d[cand, :4] - row[:4]).max(1).min())
+            stats["det_box_max_abs"] = max(stats["det_box_max_abs"], nearest)
+            if nearest > tol:
+                raise ExportParityError(f"exported box is {nearest:.4g} px from the nearest PyTorch box of the same class and "
+                                        f"score (tolerance {tol:.3g}): detection boxes differ from PyTorch")
+        top = min(10, len(g), len(w))
+        diff = float(np.abs(np.sort(g[:, 4])[::-1][:top] - np.sort(w[:, 4])[::-1][:top]).max())
+        stats["det_score_max_abs"] = max(stats["det_score_max_abs"], diff)
+        n_got, n_want = int((g[:, 4] > conf + 0.05).sum()), int((w[:, 4] > conf + 0.05).sum())
+        if abs(n_got - n_want) > max(1, int(0.05 * max(n_got, n_want))):
+            raise ExportParityError(f"{n_got} confident detections in the export vs {n_want} in PyTorch")
+        stats["det_confident"] += len(rows)
     if stats["det_score_max_abs"] > 1e-3:
         raise ExportParityError(f"detection scores differ from PyTorch: max abs diff {stats['det_score_max_abs']:.4g}")
-    if stats["det_box_max_abs"] > 0.1:  # pixels
-        raise ExportParityError(f"detection boxes differ from PyTorch: max abs diff {stats['det_box_max_abs']:.4g} px")
     return stats
 
 
 @torch.no_grad()
 def verify_onnx(wrapper: nn.Module, onnx_path: str | Path, imgsz, batch: int = 1, seg_dtype: str = "int32",
-                x: Optional[torch.Tensor] = None, min_agree: float = 0.999) -> Dict[str, float]:
+                x: Optional[torch.Tensor] = None, min_agree: float = 0.999, det_head: str = "topk",
+                trt_topk: bool = True) -> Dict[str, float]:
     """Run PyTorch and ONNX Runtime on the same input and compare every output.
 
-    Detections are compared tie-robustly (:func:`_det_parity`); class maps may differ on exact argmax ties only
-    (>= ``min_agree`` of the pixels must agree); logits must match numerically. Pass a real, letterboxed frame as
-    ``x`` for a meaningful check of a trained model (the default is a smooth random image)."""
+    Detections: :func:`_det_check` (tie-robust). For ``det_head='raw'`` the dense tensor is also compared numerically and
+    the host-side top-k is checked like an in-graph one. Class maps may differ on exact argmax ties only (>=
+    ``min_agree`` of the pixels must agree); logits must match numerically. Pass a real, letterboxed frame as ``x`` for a
+    meaningful check of a trained model (the default is a smooth random image)."""
     import onnxruntime as ort
+
+    from adas_mt.deploy.postprocess import topk_det_batch
 
     if x is None:
         x = _smooth_random(batch, imgsz)
     elif x.shape[0] != batch:
         x = x[:1].expand(batch, -1, -1, -1).contiguous()
+    det = wrapper.model.model[-1]
     sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
     got = dict(zip(OUTPUT_NAMES, sess.run(list(OUTPUT_NAMES), {INPUT_NAME: x.numpy()})))
-    want = dict(zip(OUTPUT_NAMES, (t.numpy() for t in wrapper(x))))
-    stats = _det_parity(got["det"], want["det"])
+    with _head_mode(det, "raw", trt_topk):  # PyTorch's dense predictions, before any top-k
+        dense = wrapper(x)[0].numpy()
+    with _head_mode(det, "topk", trt_topk):
+        want = dict(zip(OUTPUT_NAMES, (t.numpy() for t in wrapper(x))))
+    if det_head == "raw":
+        d = np.abs(got["det"] - dense)
+        box_err, score_err = float(d[..., :4].max()), float(d[..., 4:].max())
+        if box_err > _box_tol(dense) or score_err > 1e-3:
+            raise ExportParityError(f"dense detections differ from PyTorch: boxes {box_err:.4g} px, scores {score_err:.4g}")
+        stats = _det_check(topk_det_batch(got["det"], int(det.max_det)), dense, want["det"])
+        stats.update(raw_box_max_abs=box_err, raw_score_max_abs=score_err)
+    else:
+        stats = _det_check(got["det"], dense, want["det"])
     for k in ("da", "ll"):
         if seg_dtype == "logits":
             diff = float(np.abs(got[k] - want[k]).max())
@@ -273,6 +345,9 @@ def verify_onnx(wrapper: nn.Module, onnx_path: str | Path, imgsz, batch: int = 1
             stats[f"{k}_agree"] = agree
             if agree < min_agree:
                 raise ExportParityError(f"{k} class map agrees with PyTorch on only {agree:.4%} of the pixels")
+            if len(np.unique(want[k])) == 1:
+                LOG.warning("the %s class map is a single class on the verification input, so its parity check is weak; "
+                            "pass verify_image=<a real frame>", k)
     return stats
 
 
@@ -299,13 +374,21 @@ def export_onnx(
     decompose_pixel_shuffle: bool = False,
     verify: bool = True,
     verify_image: str | Path | None = None,
+    det_head: str = "topk",
+    trt_topk: bool = True,
 ) -> ExportResult:
     """Export ``weights`` (a ``.pt`` written by the trainer, or a model) to ``out`` (default: next to the weights).
 
-    ``verify_image``: a real frame for the PyTorch-vs-ONNX parity check (default: seeded noise, which exercises the
-    segmentation heads but yields no confident detections)."""
+    ``verify_image``: a real frame for the PyTorch-vs-ONNX parity check (default: a seeded smooth random image).
+    ``det_head``: ``topk`` (NMS-free top-k inside the graph, ``det`` is ``(B, 300, 6)``) or ``raw`` (the graph ends at the
+    dense predictions and the top-k runs on the host; the fallback for INT8 builds on TensorRT 10.3.0 / JetPack 6.x).
+    ``trt_topk``: use the grouped exact top-k Ultralytics uses for its TensorRT export (smaller TopK layers)."""
+    if det_head not in DET_HEADS:
+        raise ValueError(f"det_head must be one of {DET_HEADS}, got {det_head!r}")
     if opset < 13:
         raise ValueError("opset must be >= 13 (ArgMax/Resize semantics the graph relies on)")
+    if opset > 17:
+        LOG.warning("opset %d: the TensorRT 8.6 ONNX parser supports up to opset 17", opset)
     if batch < 1:
         raise ValueError("batch must be >= 1")
     imgsz = _resolve_imgsz(weights, imgsz)
@@ -323,26 +406,27 @@ def export_onnx(
 
     wrapper = DeployWrapper(model, seg_dtype).eval()
     det = model.model[-1]
-    prev_export, det.export = getattr(det, "export", False), True  # Detect returns the decoded tensor only
-    try:
+    with _head_mode(det, det_head, trt_topk):
         x = torch.zeros(batch, 3, *imgsz)
         with torch.no_grad():
             wrapper(x)  # warm-up / shape check before tracing
         axes = {INPUT_NAME: {0: "batch"}, "det": {0: "batch"}, "da": {0: "batch"}, "ll": {0: "batch"}} if dynamic else None
+        # torch < 2.5 only has the TorchScript exporter (no `dynamo` argument); >= 2.9 defaults to dynamo, which we avoid
+        extra = {"dynamo": False} if "dynamo" in inspect.signature(torch.onnx.export).parameters else {}
         with warnings.catch_warnings():
             # the tracer's "converted a tensor to a Python bool" notes are about shape constants (anchors, top-k size)
             # that are intentionally frozen for the static spatial size; the parity check below covers the result
             warnings.simplefilter("ignore", (torch.jit.TracerWarning, DeprecationWarning))
             torch.onnx.export(
                 wrapper, (x,), str(out), input_names=[INPUT_NAME], output_names=list(OUTPUT_NAMES), opset_version=opset,
-                do_constant_folding=True, dynamic_axes=axes, dynamo=False,
+                do_constant_folding=True, dynamic_axes=axes, **extra,
             )
         if simplify:
             _simplify(out)
-        _pin_io_shapes(out, imgsz, "batch" if dynamic else batch, int(det.max_det), seg_dtype,
-                       (model.da_classes, model.ll_classes))
+        _pin_io_shapes(out, imgsz, "batch" if dynamic else batch, det_output_shape(det, imgsz, det_head, "batch" if dynamic else batch),
+                       seg_dtype, (model.da_classes, model.ll_classes))
         meta = build_meta(model, imgsz, batch, dynamic, opset, seg_dtype, str(weights) if isinstance(weights, (str, Path)) else "<model>",
-                          decompose_pixel_shuffle)
+                          decompose_pixel_shuffle, det_head, trt_topk)
         _embed_meta(out, meta)
         meta_file = meta_path(out)
         meta_file.write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -356,16 +440,14 @@ def export_onnx(
         parity: Dict[str, float] = {}
         if verify:
             vx = _load_verify_image(verify_image, imgsz) if verify_image else None
-            parity = verify_onnx(wrapper, out, imgsz, batch=batch, seg_dtype=seg_dtype, x=vx)
+            kw = dict(seg_dtype=seg_dtype, x=vx, det_head=det_head, trt_topk=trt_topk)
+            parity = verify_onnx(wrapper, out, imgsz, batch=batch, **kw)
             if dynamic and batch != 2:  # the batch axis must really be free
-                parity.update({f"b2_{k}": v for k, v in
-                               verify_onnx(wrapper, out, imgsz, batch=2, seg_dtype=seg_dtype, x=vx).items()})
+                parity.update({f"b2_{k}": v for k, v in verify_onnx(wrapper, out, imgsz, batch=2, **kw).items()})
             if not parity.get("det_confident"):
                 LOG.warning("the verification input produced no confident detections: boxes were only checked through "
                             "the score vector. Pass verify_image=<a real frame> for a full check of a trained model.")
             LOG.info("ONNX parity vs PyTorch: %s", {k: round(v, 6) for k, v in parity.items()})
-    finally:
-        det.export = prev_export
     LOG.info("exported %s (%.1f MB)", out, out.stat().st_size / 1e6)
     return ExportResult(out, meta_file, meta, parity, ops, audit)
 
@@ -381,13 +463,13 @@ def _load_verify_image(path: str | Path, imgsz) -> torch.Tensor:
     return torch.from_numpy(preprocess(img, imgsz)[0])[None]
 
 
-def _pin_io_shapes(path: Path, imgsz, batch, max_det: int, seg_dtype: str, seg_classes) -> None:
+def _pin_io_shapes(path: Path, imgsz, batch, det_shape: list, seg_dtype: str, seg_classes) -> None:
     """Rewrite the declared input/output shapes. The tracer leaves stale symbolic dims on dynamic-batch graphs
     (even ``[batch, batch, W]``); consumers and ``onnx.checker`` should see the real ones."""
     import onnx
 
     h, w = imgsz
-    shapes = {INPUT_NAME: [batch, 3, h, w], "det": [batch, max_det, 6]}
+    shapes = {INPUT_NAME: [batch, 3, h, w], "det": det_shape}
     for k, c in zip(("da", "ll"), seg_classes):
         shapes[k] = [batch, c, h, w] if seg_dtype == "logits" else [batch, h, w]
     m = onnx.load(str(path))

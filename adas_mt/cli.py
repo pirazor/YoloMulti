@@ -104,18 +104,18 @@ def cmd_export(a: argparse.Namespace) -> int:
 
     r = export_onnx(a.weights, a.out, imgsz=a.imgsz, batch=a.batch, dynamic=a.dynamic, seg_dtype=a.seg_dtype, opset=a.opset,
                     simplify=a.simplify, decompose_pixel_shuffle=a.decompose_pixel_shuffle, verify=a.verify,
-                    verify_image=a.verify_image)
+                    verify_image=a.verify_image, det_head=a.det_head, trt_topk=a.trt_topk)
     print(f"{r.onnx}\n{r.meta_file}\nparity: " + ", ".join(f"{k}={v:.3g}" for k, v in r.parity.items()))
     return 0
 
 
 def cmd_trt_build(a: argparse.Namespace) -> int:
-    from adas_mt.deploy.trt_build import build_engine, trtexec_command
+    from adas_mt.deploy.trt_build import build_engine, trtexec_command, trtexec_timing_command
 
-    keep = a.keep_fp16[0] if len(a.keep_fp16) == 1 else a.keep_fp16
-    r = build_engine(a.onnx, a.engine, a.precision, a.workspace_mb, a.calib, a.calib_n, a.calib_cache, keep, a.timing_cache,
-                     a.opt_batch, a.max_batch, a.opt_level, a.verbose)
-    print(f"{r.engine} ({r.seconds:.0f} s)\nequivalent: " + trtexec_command(a.onnx, r.engine, a.precision, a.workspace_mb))
+    r = build_engine(a.onnx, a.engine, a.precision, a.workspace_mb, a.calib, a.calib_n, a.calib_cache, a.keep_fp16,
+                     a.timing_cache, a.opt_batch, a.max_batch, a.opt_level, a.verbose)
+    print(f"{r.engine} ({r.seconds:.0f} s)\nbuild equivalent: " + trtexec_command(a.onnx, r.engine, a.precision, a.workspace_mb, a.calib_cache)
+          + "\ntime the engine: " + trtexec_timing_command(r.engine))
     return 0
 
 
@@ -208,6 +208,11 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--verify-image", default=None, help="a real frame for the parity check (recommended for trained models)")
     e.add_argument("--decompose-pixel-shuffle", action="store_true",
                    help="replace DepthToSpace by Reshape/Transpose/Reshape if the engine build rejects it")
+    e.add_argument("--det-head", dest="det_head", choices=["topk", "raw"], default="topk",
+                   help="topk: NMS-free top-k in the graph (default). raw: dense predictions, top-k on the host "
+                        "(fallback for INT8 on TensorRT 10.3.0 / JetPack 6.x)")
+    e.add_argument("--no-trt-topk", dest="trt_topk", action="store_false",
+                   help="one big TopK instead of the grouped exact top-k Ultralytics uses for TensorRT")
     e.set_defaults(func=cmd_export)
 
     b = sub.add_parser("trt-build", help="ONNX -> TensorRT engine (run ON the Jetson)")
@@ -256,7 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--data", required=True, type=Path)
     ev.add_argument("--split", default="val")
     ev.add_argument("--batch", type=int, default=16)
-    ev.add_argument("--device", default="cpu")
+    ev.add_argument("--device", default=None, help="default: 0 for an .engine, cpu for an .onnx")
     ev.add_argument("--backend", choices=["auto", "trt", "ort"], default="auto")
     ev.add_argument("--conf", type=float, default=0.001)
     ev.add_argument("--workers", type=int, default=2)

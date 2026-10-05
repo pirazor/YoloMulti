@@ -22,8 +22,11 @@ def read_meta(model_path: str | Path) -> Dict[str, Any]:
         if cand.is_file():
             return json.loads(cand.read_text(encoding="utf-8"))
     if p.suffix == ".onnx" and p.is_file():
-        import onnx
-
+        try:
+            import onnx
+        except ImportError as e:
+            raise FileNotFoundError(f"no metadata for {p}: expected {sidecar}. Copy the .json next to the model (the copy "
+                                    "embedded in the ONNX can only be read with the `onnx` package)") from e
         for prop in onnx.load(str(p), load_external_data=False).metadata_props:
             if prop.key == "adas_mt":
                 return json.loads(prop.value)

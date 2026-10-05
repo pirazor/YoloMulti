@@ -3,7 +3,11 @@
 It implements the API surface the code uses and enforces the 8.6-vs-10 differences that matter:
 
 * 8.6: ``create_network`` must get ``1 << EXPLICIT_BATCH`` or the ONNX parser refuses the model;
-* 10.x: ``create_network(0)`` is right (EXPLICIT_BATCH is the default), ``max_workspace_size`` does not exist.
+* 10.x: ``create_network(0)`` is right (EXPLICIT_BATCH is the default), ``max_workspace_size`` and the builder's
+  ``platform_has_fast_fp16`` do not exist, and ``set_calibration_profile`` fails ("causes internal errors", as
+  Ultralytics' own TensorRT builder documents);
+* a timing cache from another version is refused (``set_timing_cache`` -> False, ``get_timing_cache`` -> None);
+* an invalid optimisation profile makes ``add_optimization_profile`` return -1.
 
 "Engines" are small JSON blobs pointing at the ONNX; executing one runs ONNX Runtime on the raw device pointers the
 backend bound with ``set_tensor_address`` (CPU tensors in the tests), so the whole control flow of
@@ -72,16 +76,21 @@ class _Tensor:
 
 
 class _Layer:
-    def __init__(self, node, out_types):
+    def __init__(self, node, out_types, in_types):
         self.name = node.name
         self.type = LayerType.CONSTANT if node.op_type == "Constant" else LayerType.OTHER
         self.num_outputs = len(node.output)
         self._out = [_Tensor(o, t, ()) for o, t in zip(node.output, out_types)]
+        self._in = [_Tensor(i, t, ()) if i else None for i, t in zip(node.input, in_types)]
+        self.num_inputs = len(self._in)
         self.precision = None
         self.output_types: dict = {}
 
     def get_output(self, j):
         return self._out[j]
+
+    def get_input(self, j):
+        return self._in[j]
 
     def set_output_type(self, j, dtype):
         self.output_types[j] = dtype
@@ -104,6 +113,10 @@ class _Network:
     def get_output(self, i):
         return self.outputs[i]
 
+    @property
+    def num_outputs(self):
+        return len(self.outputs)
+
 
 class _Parser:
     def __init__(self, network: _Network, logger, major: int):
@@ -122,9 +135,13 @@ class _Parser:
             return False
         m = shape_inference.infer_shapes(onnx.load(path))
         types = {v.name: v.type.tensor_type.elem_type for v in list(m.graph.value_info) + list(m.graph.output) + list(m.graph.input)}
+        types.update({i.name: i.data_type for i in m.graph.initializer})
+
+        def trt_type(name):
+            return _ONNX_TO_TRT.get(types.get(name, TensorProto.FLOAT), DataType.FLOAT)
+
         for node in m.graph.node:
-            outs = [_ONNX_TO_TRT.get(types.get(o, TensorProto.FLOAT), DataType.FLOAT) for o in node.output]
-            self.network.layers.append(_Layer(node, outs))
+            self.network.layers.append(_Layer(node, [trt_type(o) for o in node.output], [trt_type(i) for i in node.input]))
 
         def shp(v):
             return tuple(d.dim_value if d.dim_value > 0 else -1 for d in v.type.tensor_type.shape.dim)
@@ -153,6 +170,7 @@ class _TimingCache:
 
 class _Config:
     def __init__(self, major: int):
+        self.major = major
         self.flags, self.pools, self.profiles, self.int8_calibrator = set(), {}, [], None
         self.calibration_profile, self.timing_cache, self.builder_optimization_level = None, None, None
         if major < 10:
@@ -165,15 +183,24 @@ class _Config:
         self.pools[pool] = size
 
     def add_optimization_profile(self, p):
+        for mn, op, mx in p.shapes.values():
+            if not (mn[0] <= op[0] <= mx[0]):
+                return -1
         self.profiles.append(p)
+        return len(self.profiles) - 1
 
     def set_calibration_profile(self, p):
+        if self.major >= 10:
+            raise RuntimeError("internal error: set_calibration_profile is deprecated in TensorRT 10")
         self.calibration_profile = p
+        return True
 
     def create_timing_cache(self, blob):
         return _TimingCache(blob)
 
     def set_timing_cache(self, cache, ignore_mismatch):
+        if cache.blob.startswith(b"foreign") and not ignore_mismatch:
+            return False  # cache built by another TensorRT version / GPU
         self.timing_cache = cache
         return True
 
@@ -182,10 +209,11 @@ class _Config:
 
 
 class _Builder:
-    platform_has_fast_fp16 = True
-
     def __init__(self, logger, major):
         self.major, self.last = major, None
+        if major < 10:  # removed from the Builder in TensorRT 10
+            self.platform_has_fast_fp16 = True
+            self.platform_has_fast_int8 = True
 
     def create_network(self, flags=0):
         return _Network(flags)

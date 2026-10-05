@@ -243,3 +243,45 @@ def test_gpu_preprocess_path_matches_cpu_path(onnx_path):
     a, b = cpu(f), gpu(f)
     assert (a.da == b.da).mean() > 0.99 and (a.ll == b.ll).mean() > 0.99
     assert a.info == b.info
+
+
+# --------------------------------------------------------------------------- findings of the independent review
+def _write_avi(path, frames, fps):
+    h, w = frames[0].shape[:2]
+    wr = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (w, h))
+    for f in frames:
+        wr.write(cv2.resize(f, (w, h)))
+    wr.release()
+
+
+def test_predict_keeps_the_source_fps_and_resizes_frames_of_another_size(onnx_path, tmp_path):
+    vid = tmp_path / "v.avi"
+    _write_avi(vid, [_frame(72, 128, seed=i) for i in range(4)], fps=10)
+    info = {}
+    assert len(list(iter_frames(vid, info))) == 4 and info["fps"] == pytest.approx(10.0, abs=0.5)
+    predict(onnx_path, vid, tmp_path / "out", conf=0.05)
+    cap = cv2.VideoCapture(str(tmp_path / "out" / "predictions.mp4"))
+    assert cap.get(cv2.CAP_PROP_FPS) == pytest.approx(10.0, abs=0.5)  # not the hard-coded 30
+    n = 0
+    while cap.read()[0]:
+        n += 1
+    assert n == 4
+    # an explicit fps wins; frames whose size changes mid-stream are resized, not silently dropped
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    cv2.imwrite(str(mixed / "0.png"), _frame(72, 128))
+    cv2.imwrite(str(mixed / "1.png"), _frame(90, 160))
+    assert predict(onnx_path, mixed, tmp_path / "out2", conf=0.05)["frames"] == 2
+
+
+def test_missing_sidecar_without_onnx_package_explains_how_to_fix_it(onnx_path, tmp_path, monkeypatch):
+    import sys
+
+    from adas_mt.deploy.meta import read_meta
+
+    lone = tmp_path / "lone.onnx"
+    lone.write_bytes(onnx_path.read_bytes())
+    monkeypatch.setitem(sys.modules, "onnx", None)  # `import onnx` fails, like on a bare Jetson venv
+    with pytest.raises(FileNotFoundError, match="Copy the .json"):
+        read_meta(lone)
+    assert read_meta(onnx_path)["imgsz"] == list(HW)  # with the sidecar it needs nothing

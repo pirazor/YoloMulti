@@ -62,6 +62,13 @@ def test_fp16_build_per_tensorrt_version(onnx_static, tmp_path, version):
     assert side["engine"]["precision"] == "fp16" and side["engine"]["tensorrt"] == version and side["imgsz"] == list(HW)
 
 
+def test_removed_tensorrt10_attributes_are_not_needed(onnx_static, tmp_path):
+    t10, t86 = make_fake_trt("10.3.0"), make_fake_trt("8.6.1")
+    build_engine(onnx_static, tmp_path / "a.engine", trt_module=t10)
+    build_engine(onnx_static, tmp_path / "b.engine", trt_module=t86)
+    assert not hasattr(t10.builders[0], "platform_has_fast_fp16") and hasattr(t86.builders[0], "platform_has_fast_fp16")
+
+
 def test_fp32_build_sets_no_precision_flags(onnx_static, tmp_path):
     trt = make_fake_trt()
     build_engine(onnx_static, tmp_path / "m.engine", precision="fp32", trt_module=trt)
@@ -246,3 +253,102 @@ def test_open_backend_picks_by_suffix(onnx_static, tmp_path):
     assert isinstance(open_backend(eng, device="cpu", trt_module=trt), TrtBackend)
     with pytest.raises(ValueError):
         open_backend(onnx_static, backend="nope")
+
+
+# --------------------------------------------------------------------------- findings of the independent review
+@pytest.mark.parametrize("version,has_profile", [("8.6.1", True), ("10.3.0", False), ("10.16.0", False)])
+def test_calibration_profile_only_before_tensorrt10(onnx_dynamic, tmp_path, images, version, has_profile):
+    trt = make_fake_trt(version)  # the fake raises on 10 like the real library "causes internal errors"
+    build_engine(onnx_dynamic, tmp_path / "d.engine", precision="int8", calib=images, calib_n=2, trt_module=trt, calib_device="cpu")
+    assert (trt.builders[0].config.calibration_profile is not None) == has_profile
+
+
+def test_int8_pins_never_touch_outputs_or_integer_inputs(onnx_static, tmp_path, images):
+    trt = make_fake_trt()
+    build_engine(onnx_static, tmp_path / "m.engine", precision="int8", calib=images, calib_n=2, keep_fp16="heads",
+                 trt_module=trt, calib_device="cpu")
+    net = trt.builders[0].network
+    outputs = {net.get_output(i).name for i in range(net.num_outputs)}
+    pinned = [net.get_layer(i) for i in range(net.num_layers) if net.get_layer(i).precision == DataType.HALF]
+    assert pinned
+    for l in pinned:
+        assert not any(l.get_output(j).name in outputs for j in range(l.num_outputs)), l.name
+        ins = [l.get_input(j) for j in range(l.num_inputs) if l.get_input(j) is not None]
+        assert all(t.dtype in (DataType.FLOAT, DataType.HALF) for t in ins), l.name
+    producers = [net.get_layer(i) for i in range(net.num_layers)
+                 if any(net.get_layer(i).get_output(j).name in outputs for j in range(net.get_layer(i).num_outputs))]
+    assert producers and all(l.precision is None for l in producers)
+
+
+def test_keep_fp16_accepts_presets_aliases_and_substrings_in_lists(onnx_static, tmp_path, images, caplog):
+    from adas_mt.deploy.trt_build import resolve_keep_fp16
+
+    meta = {"layers": {"det": "/model.23/", "da": "/da_head/", "ll": "/ll_head/"}}
+    assert resolve_keep_fp16("heads", meta) == ["/model.23/", "/da_head/", "/ll_head/"]
+    assert resolve_keep_fp16(["seg", "/model.5/"], meta) == ["/da_head/", "/ll_head/", "/model.5/"]
+    assert resolve_keep_fp16(["det"], meta) == ["/model.23/"] and resolve_keep_fp16("none", meta) == []
+    trt = make_fake_trt()
+    build_engine(onnx_static, tmp_path / "m.engine", precision="int8", calib=images, calib_n=2, keep_fp16=["heads", "seg"],
+                 trt_module=trt, calib_device="cpu")
+    net = trt.builders[0].network
+    assert any(net.get_layer(i).precision == DataType.HALF for i in range(net.num_layers))
+    with caplog.at_level("WARNING", logger="adas_mt.trt_build"):
+        build_engine(onnx_static, tmp_path / "n.engine", precision="int8", calib=images, calib_n=2, keep_fp16=["/nope/"],
+                     trt_module=make_fake_trt(), calib_device="cpu")
+    assert "matched no layer" in caplog.text
+
+
+def test_int8_on_tensorrt_10_3_warns_unless_the_head_is_raw(model, onnx_static, tmp_path, images, caplog):
+    raw = export_onnx(model, tmp_path / "raw.onnx", imgsz=HW, det_head="raw").onnx
+    for onnx, version, expect in ((onnx_static, "10.3.0", True), (raw, "10.3.0", False), (onnx_static, "10.16.0", False),
+                                  (onnx_static, "8.6.1", False)):
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="adas_mt.trt_build"):
+            build_engine(onnx, tmp_path / f"{onnx.stem}_{version}.engine", precision="int8", calib=images, calib_n=2,
+                         trt_module=make_fake_trt(version), calib_device="cpu")
+        assert ("10.3.x" in caplog.text) == expect, (onnx.name, version)
+
+
+def test_foreign_timing_cache_does_not_lose_the_engine_or_its_metadata(onnx_static, tmp_path, caplog):
+    tc = tmp_path / "t.cache"
+    tc.write_bytes(b"foreign-version-cache")
+    with caplog.at_level("WARNING", logger="adas_mt.trt_build"):
+        r = build_engine(onnx_static, tmp_path / "m.engine", timing_cache=tc, trt_module=make_fake_trt())
+    assert r.engine.is_file() and meta_path(r.engine).is_file()  # engine and sidecar exist even though the cache failed
+    assert "does not match" in caplog.text and "could not save the timing cache" in caplog.text
+    assert tc.read_bytes() == b"foreign-version-cache"  # the old file is left alone
+
+
+def test_invalid_batch_profile_is_rejected_up_front(onnx_dynamic, tmp_path):
+    with pytest.raises(TrtBuildError, match="opt_batch <= max_batch"):
+        build_engine(onnx_dynamic, tmp_path / "d.engine", opt_batch=4, max_batch=2, trt_module=make_fake_trt())
+
+
+def test_trt_backend_needs_cuda_and_keeps_logger_and_runtime_alive(onnx_static, tmp_path):
+    trt = make_fake_trt()
+    eng = build_engine(onnx_static, tmp_path / "m.engine", trt_module=trt).engine
+    with pytest.raises(ValueError, match="CUDA device"):
+        TrtBackend(eng, device="cpu")  # a real engine must never be handed CPU pointers
+    be = TrtBackend(eng, device="cpu", trt_module=trt)  # only a fake module may run on the CPU
+    assert be._logger is not None and be._runtime is not None
+    be.infer(structured_frame(HW))
+    be.close()
+    assert be.engine is None
+
+
+def test_raw_head_engine_roundtrip(model, tmp_path):
+    """--det-head raw: the engine returns dense predictions and the runner does the top-k."""
+    from adas_mt.deploy.runner import Pipeline
+
+    topk = export_onnx(model, tmp_path / "t.onnx", imgsz=HW).onnx
+    raw = export_onnx(model, tmp_path / "r.onnx", imgsz=HW, det_head="raw").onnx
+    trt = make_fake_trt()
+    eng = build_engine(raw, tmp_path / "r.engine", trt_module=trt).engine
+    pa, pb = Pipeline(topk, conf=0.05), Pipeline(eng, backend="trt", conf=0.05, device="cpu", trt_module=trt)
+    f = (np.random.default_rng(3).integers(0, 256, (72, 128, 3))).astype(np.uint8)
+    f = cv2.GaussianBlur(f, (0, 0), 4)
+    ra, rb = pa(f), pb(f)
+    assert pb.det_head == "raw" and len(ra) == len(rb) > 0
+    key = lambda r: sorted(zip(r.classes.tolist(), np.round(r.scores, 4).tolist()))  # noqa: E731
+    assert key(ra) == key(rb)
+    assert np.array_equal(ra.da, rb.da) and np.array_equal(ra.ll, rb.ll)

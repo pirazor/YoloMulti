@@ -22,6 +22,7 @@ import cv2
 import numpy as np
 
 from .meta import read_meta
+from .postprocess import decode_det
 from .preprocess import LetterboxInfo, letterbox_torch, preprocess
 
 LOG = logging.getLogger("adas_mt.runner")
@@ -71,15 +72,22 @@ class TrtBackend:
     def __init__(self, path: str | Path, device: str = "cuda", trt_module: Any = None):
         import torch
 
+        dev = torch.device(device)
+        if dev.type != "cuda" and trt_module is None:
+            # the engine would be handed CPU pointers: an illegal memory access at best, silent garbage at worst
+            raise ValueError(f"TensorRT engines need a CUDA device (got {device!r}); use e.g. device='cuda' or '0'")
         trt = trt_module
         if trt is None:
             try:
                 import tensorrt as trt  # type: ignore[no-redef]
             except ImportError as e:  # pragma: no cover - device only
                 raise RuntimeError("`tensorrt` is not importable; on a Jetson create the venv with --system-site-packages") from e
-        self.torch, self.trt, self.device = torch, trt, torch.device(device)
-        runtime = trt.Runtime(trt.Logger(trt.Logger.WARNING))
-        self.engine = runtime.deserialize_cuda_engine(Path(path).read_bytes())
+        self.torch, self.trt, self.device = torch, trt, dev
+        # the logger and the runtime must outlive the engine: a collected logger crashes TensorRT, and the engine
+        # keeps raw pointers into both
+        self._logger = trt.Logger(trt.Logger.WARNING)
+        self._runtime = trt.Runtime(self._logger)
+        self.engine = self._runtime.deserialize_cuda_engine(Path(path).read_bytes())
         if self.engine is None:
             raise RuntimeError(f"could not deserialize {path}: engines only load on the TensorRT version and GPU they were built on")
         self.context = self.engine.create_execution_context()
@@ -140,7 +148,7 @@ class TrtBackend:
 
     def close(self) -> None:
         self._bufs.clear()
-        self.context = self.engine = None
+        self.context = self.engine = self._runtime = None
 
 
 def open_backend(model: str | Path, backend: str = "auto", device: str = "cuda", providers=None, trt_module: Any = None):
@@ -150,7 +158,7 @@ def open_backend(model: str | Path, backend: str = "auto", device: str = "cuda",
     if backend == "ort":
         return OrtBackend(model, providers)
     if backend == "trt":
-        return TrtBackend(model, device, trt_module)
+        return TrtBackend(model, f"cuda:{device}" if str(device).isdigit() else device, trt_module)
     raise ValueError(f"backend must be auto|ort|trt, got {backend!r}")
 
 
@@ -180,6 +188,7 @@ class Pipeline:
         self.meta = read_meta(self.model)
         self.backend = open_backend(self.model, backend, device, providers, trt_module)
         self.net_hw: Tuple[int, int] = tuple(self.meta["imgsz"])  # type: ignore[assignment]
+        self.det_head = self.meta.get("det_head", "topk")
         if tuple(self.backend.input_hw) != self.net_hw:
             raise ValueError(f"{self.model} has input {tuple(self.backend.input_hw)} but its metadata says {self.net_hw}")
         self.conf, self.masks_at, self.gpu_preprocess, self.device = float(conf), masks_at, bool(gpu_preprocess), device
@@ -197,12 +206,15 @@ class Pipeline:
             import torch
 
             t = torch.from_numpy(np.ascontiguousarray(frame)).to(self.device)
-            return letterbox_torch(t, self.net_hw)
+            x, info = letterbox_torch(t, self.net_hw)
+            if x.is_cuda:
+                torch.cuda.synchronize(x.device)  # kernels are async: without it the cost lands in the "infer" stage
+            return x, info
         arr, info = preprocess(frame, self.net_hw)
         return arr[None], info
 
     def _post(self, out: Dict[str, np.ndarray], info: LetterboxInfo) -> Result:
-        det = np.asarray(out["det"])[0]
+        det = decode_det(out["det"], self.meta)[0]  # host top-k for --det-head raw exports
         det = det[det[:, 4] >= self.conf]
         boxes = info.boxes_to_original(det[:, :4]) if len(det) else np.zeros((0, 4), np.float32)
         ok = (boxes[:, 2] - boxes[:, 0] >= 1) & (boxes[:, 3] - boxes[:, 1] >= 1)  # drop boxes clipped away entirely
@@ -282,13 +294,15 @@ IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 VID_EXT = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 
 
-def iter_frames(source: str | int | Path) -> Iterator[Tuple[str, np.ndarray]]:
+def iter_frames(source: str | int | Path, info: Optional[dict] = None) -> Iterator[Tuple[str, np.ndarray]]:
     """Yield ``(name, bgr_frame)`` from an image, a directory of images, a video file, a camera index
-    (``0``) or a GStreamer pipeline string (contains ``!``, e.g. a CSI camera on a Jetson)."""
+    (``0``) or a GStreamer pipeline string (contains ``!``, e.g. a CSI camera on a Jetson).
+    ``info`` (a dict) receives ``fps`` for video / camera sources once they are opened."""
     src = str(source)
+    info = info if info is not None else {}
     if src.isdigit() or "!" in src:
         cap = cv2.VideoCapture(int(src) if src.isdigit() else src, cv2.CAP_ANY if src.isdigit() else cv2.CAP_GSTREAMER)
-        yield from _capture(cap, "camera" if src.isdigit() else "gst", src)
+        yield from _capture(cap, "camera" if src.isdigit() else "gst", src, info)
         return
     p = Path(src)
     if p.is_dir():
@@ -301,7 +315,7 @@ def iter_frames(source: str | int | Path) -> Iterator[Tuple[str, np.ndarray]]:
                 raise OSError(f"cannot read {f}")
             yield f.name, img
     elif p.suffix.lower() in VID_EXT:
-        yield from _capture(cv2.VideoCapture(str(p)), p.stem, src)
+        yield from _capture(cv2.VideoCapture(str(p)), p.stem, src, info)
     elif p.is_file():
         img = cv2.imread(str(p))
         if img is None:
@@ -311,9 +325,12 @@ def iter_frames(source: str | int | Path) -> Iterator[Tuple[str, np.ndarray]]:
         raise FileNotFoundError(src)
 
 
-def _capture(cap, stem: str, src: str) -> Iterator[Tuple[str, np.ndarray]]:
+def _capture(cap, stem: str, src: str, info: dict) -> Iterator[Tuple[str, np.ndarray]]:
     if not cap.isOpened():
         raise OSError(f"cannot open video source {src}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+    if 1.0 <= fps <= 240.0:  # cameras and some containers report 0 / nonsense
+        info["fps"] = fps
     i = 0
     try:
         while True:
@@ -402,11 +419,12 @@ def predict(model: str | Path, source: str | int | Path, out_dir: str | Path | N
     if out:
         out.mkdir(parents=True, exist_ok=True)
     is_video = str(source).isdigit() or "!" in str(source) or Path(str(source)).suffix.lower() in VID_EXT
-    writer = None
+    writer, size, warned = None, None, False
     totals: List[float] = []
     n = 0
+    src_info: dict = {}
     try:
-        for name, frame in iter_frames(source):
+        for name, frame in iter_frames(source, src_info):
             res = pipe(frame)
             totals.append(res.timings["total"])
             n += 1
@@ -415,7 +433,15 @@ def predict(model: str | Path, source: str | int | Path, out_dir: str | Path | N
                 if is_video:
                     if writer is None:
                         h, w = vis.shape[:2]
-                        writer = cv2.VideoWriter(str(out / "predictions.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), fps or 30.0, (w, h))
+                        size = (w, h)
+                        writer = cv2.VideoWriter(str(out / "predictions.mp4"), cv2.VideoWriter_fourcc(*"mp4v"),
+                                                 fps or src_info.get("fps") or 30.0, size)
+                    if (vis.shape[1], vis.shape[0]) != size:  # a VideoWriter silently drops frames of another size
+                        if not warned:
+                            LOG.warning("frame size changed mid-stream (%s -> %s): resizing to the first frame's size",
+                                        size, (vis.shape[1], vis.shape[0]))
+                            warned = True
+                        vis = cv2.resize(vis, size)
                     writer.write(vis)
                 else:
                     cv2.imwrite(str(out / f"{Path(name).stem}.jpg"), vis)
