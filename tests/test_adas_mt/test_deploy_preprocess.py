@@ -27,7 +27,8 @@ def test_matches_the_validation_dataset_pipeline_exactly(tmp_path, hw0):
         (tmp_path / d).mkdir(parents=True)
     cv2.imwrite(str(tmp_path / "images/val/f.png"), img)  # lossless: both pipelines read identical pixels
     (tmp_path / "labels_det/val/f.txt").write_text("")
-    data = {"path": str(tmp_path), "nc": 2, "names": ["a", "b"], "da_classes": 3, "ll_classes": 3}
+    data = {"path": str(tmp_path), "nc": 2, "names": ["a", "b"], "da_classes": 3, "ll_classes": 3,
+            "optional_masks": ["da", "ll"]}  # a frame without masks: the dataset would otherwise flag the empty split
     ds = MultiTaskDataset(img_path=str(tmp_path / "images/val"), data=data, imgsz=HW, augment=False, hyp=make_hyp(),
                           batch_size=1, cache=False, rect=False, prefix="")
     ref = ds[0]["img"].numpy()  # uint8 RGB CHW

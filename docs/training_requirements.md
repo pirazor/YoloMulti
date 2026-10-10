@@ -100,3 +100,40 @@ its source. They are the contract between `adas_mt` and the trainer.
 42. **Evaluation / IO:** a short last batch against a static-batch-N graph is padded (it failed before); `predict` keeps the source fps and resizes frames that
     change size mid-stream (the writer silently dropped them); `bench --gpu-preprocess` synchronises before timing the letterbox; `det` is declared as
     `(B, min(max_det, anchors), 6)`; reading an ONNX without sidecar and without the `onnx` package explains what to copy.
+
+## Found by the post-merge inspection (the whole flow replicated on synthetic 1280x720 ADAS data at 384x640)
+43. **Mask loading was the dataloader bottleneck.** Two 720p mask PNGs decode + pack in ~35 ms (more than the JPEG), and a mosaic sample read four of them
+    while Ultralytics served three of its four images from the RAM buffer; `cache: ram` did not help because masks were never cached. The dataset now packs
+    at the loaded image size, caches packed masks next to the buffered images and, with `cache: ram`, for the whole split in Ultralytics' shared cache
+    tensor: 109 -> 39 ms per mosaic sample (`docs/data.md`). A GPU step at batch 32 is faster than 8 workers at the old rate.
+44. **Warm-up floor.** Ultralytics warms up for `max(warmup_epochs * batches_per_epoch, 100)` iterations: on a small debug set (5 batches/epoch) that is 20
+    epochs of near-zero LR, which looks like "nothing learns". `warmup_epochs: 0` disables it; on real data (thousands of batches/epoch) it is irrelevant.
+45. **CPU runs use `workers=0`** whatever the config says (upstream rule); the multi-worker loader is exercised directly by the dataset tests instead.
+46. **CLI `--resume` re-applied `default.yaml`.** Ultralytics' `check_resume` applies `batch`, `close_mosaic`, `patience`, `workers`, `cache`, `val`, `plots`
+    (its "allowed" keys) from the overrides silently and only warns about the others, so merging the YAML into the resume overrides gave a run trained with
+    `--batch 16` batch 32 on resume (different `accumulate` / weight-decay scaling, possible OOM). On resume the CLI now passes only the flags given explicitly.
+47. **Python-API `resume=True`** found no `mt.yaml` (Ultralytics resolves `True` to the latest `last.pt` only inside `check_resume`); the trainer now re-reads
+    the run's `mt.yaml` after that resolution.
+48. **Autobatch (`batch=-1`) is refused**: `profile_ops` cannot `.sum()` a dict output, swallows the error and never measures the backward pass, and the probe is
+    square `imgsz x imgsz`; the estimate was meaningless and a wrong batch is only auto-reduced three times in epoch 0.
+49. **Mask PNG formats.** `cv2.IMREAD_GRAYSCALE` turned a palette PNG into luminance values, a 1-bit PNG into 0/255 (255 = ignore) and a 16-bit PNG into
+    zeros, and the packing then trained those pixels as "unlabelled" or as wrong classes with no error (fine for the converter's own 8-bit output, silent for
+    masks from other tools). The reader now decodes by PNG mode and refuses RGB masks.
+50. **Nothing validated the masks before training.** The label cache covers `labels_det` only, so a misnamed `labels_DA`, a wrong `path:` or a val split converted
+    without masks trained the task as unannotated everywhere. The dataset now logs `N/M images have DA/LL masks` per split, raises when a split has none (unless
+    `optional_masks: [task]` in data.yaml) and validates the class ids of a sample of masks (ids >= classes raise; a 0/255 binary mask is reported).
+51. **Converter:** Supervisely `bitmap` objects (its usual export for area masks) and any other undrawable geometry were dropped without a trace; bitmaps are now
+    decoded (base64, optionally zlib-compressed PNG, placed at `origin`) and the rest is counted under `skipped_geometry` with a warning. The JSON `size` is now
+    checked against the image file (coordinates are scaled into the real frame, counted and warned), and the lane thickness scales with the long side like the
+    trainer's resize, so 4:3 sources no longer get 1.5x thicker lanes.
+52. `build_transforms()` without `hyp` raised `AttributeError` (no caller hit it); `mixup`, `cutmix`, `copy_paste`, `flipud` > 0 now warn that the pipeline does not
+    implement them instead of being ignored silently.
+53. **Offline teacher weights did not load.** `FrozenTeacher(checkpoint=...)` fed the file straight into `load_state_dict`, bypassing timm's
+    `checkpoint_filter_fn` that renames Meta's DINOv3 keys (`storage_tokens`, `blocks.N.ls1.gamma`, `rope_embed.periods`, `mask_token`): Meta's official
+    `.pth` (the only file an offline user can get) raised, and the 10%-missing-keys guard would have let a file with only a lost register token load
+    silently. The filter is applied now and the load is strict.
+54. **Region losses over absent classes.** A class without ground truth in the batch has Dice ~0 whatever is predicted (constant ~1.0 term, ~0 gradient), which
+    put a floor of ~0.5 under the logged `da_loss` whenever "alternative" was absent and made the Dice term inert for it. Dice and focal Tversky now average over
+    the foreground classes present in the batch (0 when none); CE still penalises false positives of absent classes.
+55. **Loss balance is measured, not tuned** (docs/training.md): at init the trunk gradient is ~95% detection, and the one-to-one head is detached from the trunk
+    upstream, so the balance drifts with `E2ELoss`'s one-to-many decay. `loss_gains` is the ablation knob; the defaults are unchanged.

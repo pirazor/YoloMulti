@@ -23,6 +23,16 @@ Defaults worth knowing:
 * `optimizer: AdamW, lr0: 0.001, warmup_bias_lr: 0.0` set explicitly. `optimizer=auto` switches to MuSGD on runs over 10k iterations and ignores `lr0`.
 * **`nms: false`**: validation uses the NMS-free head that ships. Ultralytics' default (`None`) validates the one-to-many head + NMS, which is not the deployed model.
 * `head_lr_mult: 3`: `da_head`, `ll_head` and `kd_proj` are freshly initialised; the pretrained trunk keeps the base LR.
+* `loss_gains: {da: 1.0, ll: 1.0}` is **not tuned**. Measured at initialisation with the `yolo26s.pt` trunk at 384x640
+  (batch 4): the L2 norm of the gradient reaching the shared neck is box 43 / cls 48 / DA 2.4 / lane 0.17, i.e. the
+  trunk is shaped almost entirely by detection at the start (the lane term is small because of the 99% background
+  prior and the per-pixel normalisation). The one-to-one head is detached from the trunk upstream, so the trunk's
+  detection signal is the one-to-many loss, whose weight `E2ELoss` decays 0.8 -> 0.1 over the run: the detection :
+  segmentation balance shifts ~8x by the end. The heads get their full gradient and all three tasks learn with the
+  defaults (toy learning test), but a lane-IoU ceiling from detection-shaped P2/P3 features is the risk to ablate:
+  run `loss_gains: {da: 2-5, ll: 2-10}` against the default and compare `metrics/ll_IoU_fg` / `da_mIoU` at equal mAP.
+* Scale `n` only: Ultralytics' cls branch width is `max(ch[0], min(nc, 100))` = 64 for 9 classes vs 80 for COCO, so the
+  whole cls branch except its first conv starts fresh (at `s` only the final 1x1 does); expect a slower cls start on `n`.
 * `amp: true` runs the fp16 AMP check (needs to download `yolo26n.pt`); use `amp: bf16` on A100/H100 to skip it.
 * Augmentation is ADAS-safe: `hsv_h 0.015`, `degrees 0`, no vertical flip. Mosaic keeps native object scale (`RectMosaic`).
 * `multi_scale > 0` works: the packed mask is resized (nearest) together with the image.
@@ -52,7 +62,14 @@ projector is part of the model, so it is synchronised like any other parameter. 
 `E2ELoss` one-to-many/one-to-one schedule and the distillation schedule/teacher. The run's own `<run>/mt.yaml` is
 **authoritative** on resume (multi-task flags such as `--distill` are ignored with a warning, and the file is never rewritten):
 toggling distillation or the image size would change the optimizer parameter groups and break the resume.
+The run's training arguments are restored from the checkpoint too: `--cfg` is ignored on resume and only flags given
+explicitly on the resume command line (`--batch`, `--workers`, `--device`, ...) replace them (Ultralytics applies
+`batch`, `close_mosaic`, `patience`, `workers`, `cache`, `val`, `plots` overrides on resume without a warning, so the
+CLI no longer merges `default.yaml` back in). `batch: -1` (autobatch) is refused: it profiles a square input and
+cannot measure the backward pass of this model.
 A clean stop strips `last.pt` (Ultralytics behaviour); only a crash/kill leaves it resumable.
+Do not set `ULTRALYTICS_SAFE_LOAD=1` in the training image: it refuses to unpickle any model class that is not
+Ultralytics' own, including `MultiTaskModel` checkpoints.
 
 ## Precision notes
 * With `amp: true` Ultralytics validates in fp16 (also when training with `amp: bf16`): that matches the FP16 TensorRT deployment, so a

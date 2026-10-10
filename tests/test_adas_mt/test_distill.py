@@ -200,6 +200,40 @@ def test_stage_a_projector_restored_at_construction(tmp_path, synth_root, tiny_t
     assert all(torch.equal(b.kd_proj.state_dict()[k], v) for k, v in ck["kd_proj"].items())
 
 
+def test_local_teacher_checkpoint_accepts_meta_and_timm_formats_and_refuses_mismatches(tmp_path):
+    """--teacher_ckpt is the offline path; the file an offline user gets is Meta's dinov3_*.pth with its own key names
+    (storage_tokens, blocks.N.ls1.gamma, rope_embed.periods, mask_token), which timm renames only on hub download."""
+    import timm
+
+    from adas_mt.distill import FrozenTeacher
+
+    name = "vit_small_patch16_dinov3"
+    torch.manual_seed(1)
+    ref = timm.create_model(name, pretrained=False, num_classes=0, dynamic_img_size=True)
+    with torch.no_grad():
+        for p in ref.parameters():
+            p.add_(0.01 * torch.randn_like(p))  # non-default register token / layer scales: a lost tensor is visible
+    sd = ref.state_dict()
+    meta = {k.replace("reg_token", "storage_tokens").replace("gamma_1", "ls1.gamma").replace("gamma_2", "ls2.gamma"): v.clone()
+            for k, v in sd.items()}
+    meta["rope_embed.periods"] = torch.ones(16)
+    meta["mask_token"] = torch.zeros(1, ref.num_features)
+    torch.save(meta, tmp_path / "meta.pth")
+    torch.save(sd, tmp_path / "timm.pth")
+    for f in ("meta.pth", "timm.pth"):
+        t = FrozenTeacher(name, pretrained=False, checkpoint=tmp_path / f)
+        got = t.model.state_dict()
+        assert all(torch.equal(got[k], sd[k]) for k in sd), f
+    partial = dict(sd)
+    del partial["reg_token"]  # would silently train against a random register token before
+    torch.save(partial, tmp_path / "partial.pth")
+    with pytest.raises(ValueError, match="reg_token"):
+        FrozenTeacher(name, pretrained=False, checkpoint=tmp_path / "partial.pth")
+    torch.save(timm.create_model("vit_tiny_patch16_224", pretrained=False, num_classes=0).state_dict(), tmp_path / "other.pth")
+    with pytest.raises(ValueError, match="does not match"):
+        FrozenTeacher(name, pretrained=False, checkpoint=tmp_path / "other.pth")
+
+
 def test_stage_a_image_discovery_skips_masks_and_val(synth_root):
     from adas_mt.distill.pretrain import find_images
 

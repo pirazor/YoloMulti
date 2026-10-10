@@ -22,6 +22,7 @@ from ultralytics.data.augment import (
     RandomHSV,
     RandomPerspective,
 )
+from ultralytics.utils import LOGGER
 
 from .masks import IGNORE
 
@@ -96,8 +97,14 @@ class RectMosaic(Mosaic):
         return final
 
 
+UNSUPPORTED_AUG = ("mixup", "cutmix", "copy_paste", "flipud")  # upstream keys this pipeline does not implement
+
+
 def build_train_transforms(dataset, hw: tuple[int, int], hyp) -> Compose:
     """Rectangular training pipeline: [RectMosaic] -> RandomPerspective -> HSV -> flip."""
+    ignored = [k for k in UNSUPPORTED_AUG if getattr(hyp, k, 0)]
+    if ignored:
+        LOGGER.warning(f"{ignored} > 0 but the multi-task pipeline implements only mosaic / affine / HSV / fliplr: ignored")
     h, w = hw
     affine = RandomPerspective(
         degrees=hyp.degrees, translate=hyp.translate, scale=hyp.scale, shear=hyp.shear,

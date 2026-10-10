@@ -58,16 +58,18 @@ def cmd_train(a: argparse.Namespace) -> int:
         dist["teacher"] = a.teacher
     if a.teacher_ckpt:
         dist["teacher_ckpt"] = a.teacher_ckpt
-    overrides = {**cfg["train"], **_cli_overrides(a), "data": str(a.data), "model": a.model}
-    overrides.pop("imgsz", None)  # the geometry is mt.imgsz
     if a.resume:
-        # The run's own mt.yaml is authoritative (see MultiTaskTrainer); multi-task flags would conflict with it.
-        if given or dist:
-            logging.getLogger("adas_mt").warning("--resume: ignoring --imgsz/--scale/--distill/--teacher flags; "
-                                                 "the run's mt.yaml is used")
-        overrides["resume"] = str(a.resume)
+        # The run's own args and mt.yaml are authoritative (see MultiTaskTrainer). Ultralytics' check_resume applies
+        # `batch`, `close_mosaic`, `patience`, `workers`, `cache`, `val`, `plots`... from the overrides WITHOUT a warning,
+        # so the YAML (default.yaml or --cfg) must not be merged in: only flags given explicitly on this command line are.
+        if a.cfg is not None or given or dist:
+            logging.getLogger("adas_mt").warning("--resume: ignoring --cfg/--imgsz/--scale/--distill/--teacher; "
+                                                 "the run's own args and mt.yaml are used")
+        overrides = {**_cli_overrides(a), "data": str(a.data), "resume": str(a.resume)}
         trainer = MultiTaskTrainer(overrides=overrides, mt=None)
     else:
+        overrides = {**cfg["train"], **_cli_overrides(a), "data": str(a.data), "model": a.model}
+        overrides.pop("imgsz", None)  # the geometry is mt.imgsz
         mt.update(given)
         if dist:
             mt["distill"] = {**(mt.get("distill") or {}), **dist}
