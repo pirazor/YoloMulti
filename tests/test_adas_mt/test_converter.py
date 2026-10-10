@@ -182,3 +182,26 @@ def test_lane_thickness_scales_with_the_long_side():
     assert _line_thickness((720, 1280)) == 8 and _line_thickness((1280, 720)) == 8  # 16:9 and portrait 16:9
     assert _line_thickness((1080, 1920)) == 12 and _line_thickness((480, 640)) == 4  # 4:3 used to get 5 (by height)
     assert _line_thickness((60, 100)) == 2
+
+
+def test_synthetic_supervisely_dump_converts_and_loads(tmp_path):
+    """The Colab smoke-test path: synthetic dump -> converter (partial, clip-aware) -> dataset with all three tasks."""
+    import numpy as np
+
+    from adas_mt.data.dataset import MultiTaskDataset
+    from adas_mt.data.masks import unpack_masks
+    from adas_mt.data.synthetic import GROUP_REGEX, make_supervisely
+
+    from .conftest import make_hyp
+
+    src = make_supervisely(tmp_path / "sup", 16, seed=3)
+    stats = convert(src=src, dst=tmp_path / "out", val_fraction=0.25, partial_annotation=True, group_regex=GROUP_REGEX)
+    assert stats.images == 16 and stats.boxes > 16 and not stats.skipped_geometry and not stats.size_mismatch
+    data = yaml.safe_load((tmp_path / "out" / "data.yaml").read_text())
+    train = {p.name[:4] for p in (tmp_path / "out" / "images" / "train").glob("*.jpg")}
+    val = {p.name[:4] for p in (tmp_path / "out" / "images" / "val").glob("*.jpg")}
+    assert val and not (train & val)  # whole clips
+    ds = MultiTaskDataset(img_path=str(tmp_path / "out" / "images" / "train"), data=data, imgsz=(384, 640), augment=False,
+                          hyp=make_hyp(), batch_size=4, prefix="")
+    da, ll = unpack_masks(ds[0]["semantic_mask"], 3, 3)
+    assert {1, 2} <= set(np.unique(da.numpy()).tolist()) and (ll > 0).any() and len(ds[0]["cls"]) > 0

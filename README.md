@@ -15,6 +15,15 @@ sign_classifier/ fine-grained traffic-sign classifier (unchanged)
 legacy/yolov13/ previous YOLOv13 multi-task implementation (frozen baseline)
 ```
 
+## Train on Google Colab
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pirazor/YoloMulti/blob/main/colab/train_adas_mt.ipynb)
+[`colab/train_adas_mt.ipynb`](colab/train_adas_mt.ipynb): data (a Supervisely export, a converted dataset, or a
+synthetic demo set) → training on a Colab GPU (resumable from Google Drive) → early-results report (metric curves,
+best epoch, prediction overlays) → ONNX export with a `.pt` vs ONNX accuracy check. Choose a GPU runtime and
+*Run all*; the defaults (`synthetic`, `quick`) are a ~10-minute smoke test that the setup trains. If the repository
+is private, add a `GITHUB_TOKEN` Colab secret.
+
 ## Quick start
 
 ```bash

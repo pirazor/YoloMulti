@@ -80,6 +80,15 @@ Ultralytics' own, including `MultiTaskModel` checkpoints.
 * `compile: true` is not tested.
 * `val/kd_loss`, `val/kd_cos` are always 0 (the EMA model has no distiller); the train items are averaged over `every` steps.
 
+## Google Colab
+`colab/train_adas_mt.ipynb` runs the whole pipeline on a Colab GPU: data preparation (Supervisely export, converted
+dataset or synthetic demo frames), training through `python -m adas_mt train` with GPU-dependent defaults (batch by
+GPU memory, bf16 on Ampere+, fp16 AMP on T4, `cache: ram` with Ultralytics' automatic fallback, `deterministic: false`),
+the run directory on Google Drive so a disconnected session resumes from `last.pt`, an early-results report from
+`results.csv`, and an ONNX export whose accuracy is compared with `best.pt` on the same val images. The `quick` preset
+trains on fixed random subsets (3,000 train / 500 val images, 30 epochs) written as image lists next to the dataset,
+so a resume sees the same files.
+
 ## Tests
 `tests/test_adas_mt/test_trainer.py`: full runs on the colour-coded toy set (distillation on, EMA/optimizer contents, SGD/MuSGD regrouping,
 plots on, resume after a simulated crash, multi-scale mask resizing, DDP worker rebuild, Stage-A and official checkpoints, CLI train+val).
