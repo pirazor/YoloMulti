@@ -66,6 +66,13 @@ RAM check requires a third more than the images). Measured on 1280x720 data at 3
 sample on one core, so 8 workers feed roughly 200 samples/s. `cache: disk` caches only the images (as `.npy`); the
 masks then go through the buffer cache like the uncached case.
 
+## Synthetic demo data
+`python -m adas_mt.data.synthetic --dst /tmp/sup --n 600` writes a Supervisely-layout dump of 1280x720 road scenes
+(road / adjacent-lane drivable areas, solid / dashed lane lines, vehicles, pedestrians, traffic lights and signs painted
+into the image, some frames without lane or drivable-area annotation, 4 frames per clip named `<clip>-<frame>`). It
+exists to smoke-test the pipeline end to end (the Colab notebook's default): a working setup reaches clearly rising
+mAP / drivable-area IoU / lane IoU on it within a few epochs. It says nothing about accuracy on real roads.
+
 ## Tests
 `pytest tests/test_adas_mt` builds a synthetic set whose red/green rectangles are simultaneously
 a box, an image region and a mask region, and checks that all three stay aligned through
