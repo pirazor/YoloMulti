@@ -90,7 +90,10 @@ class DepthSplat(nn.Module):
         row, col = g.cell_of(e[:, 0], e[:, 1])
         H, W = g.hw
         valid = valid & (row >= 0) & (row < H) & (col >= 0) & (col < W) & (e[:, 2] >= g.z_min) & (e[:, 2] <= g.z_max)
-        return torch.where(valid, row * W + col, torch.full_like(row, H * W)).long()
+        # combine as integers: row * W + col reaches 38399, beyond the exact range of fp16 (an FP16 engine would
+        # round the float product and move points into neighbouring cells)
+        ri, ci = row.clamp(0, H - 1).to(torch.int32), col.clamp(0, W - 1).to(torch.int32)
+        return torch.where(valid, ri * W + ci, torch.full_like(ri, H * W)).long()
 
     def forward(self, feat, depth, K, cam2ego):
         f = self.reduce(feat)
@@ -125,13 +128,14 @@ class IPMSampler(nn.Module):
         zs = z.clamp(min=0.1)
         u = K[:, 0, 0:1] * p[:, 0] / zs + K[:, 0, 2:3]
         v = K[:, 1, 1:2] * p[:, 1] / zs + K[:, 1, 2:3]
-        gx = (u + 0.5) / img_w * 2 - 1
-        gy = (v + 0.5) / img_h * 2 - 1
+        gx = ((u + 0.5) / img_w * 2 - 1).clamp(-2.0, 2.0)  # cells behind / beside the camera project to huge u, v:
+        gy = ((v + 0.5) / img_h * 2 - 1).clamp(-2.0, 2.0)  # clamp so an FP16 engine never sees inf (-> NaN samples)
         valid = (z > 0.5) & (gx > -1) & (gx < 1) & (gy > -1) & (gy < 1)
         s = F.grid_sample(f, torch.stack([gx, gy], -1)[:, None], mode="bilinear", padding_mode="zeros",
                           align_corners=False)[:, :, 0]  # (B, C, HW)
-        m = valid.to(f.dtype)[:, None]
-        return torch.cat([s * m, m], 1).view(b, c + 1, H, W)
+        m = valid[:, None]
+        s = torch.where(m, s, torch.zeros_like(s))  # where, not multiply: NaN * 0 is NaN
+        return torch.cat([s, m.to(f.dtype)], 1).view(b, c + 1, H, W)
 
 
 class BEVDecoder(nn.Module):

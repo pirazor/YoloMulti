@@ -29,6 +29,18 @@ import numpy as np
 import yaml
 
 
+def scale_K(K: np.ndarray, src_hw: Sequence[int], dst_hw: Sequence[int]) -> np.ndarray:
+    """Intrinsics after resizing an image from ``src_hw`` to ``dst_hw`` (pixel-centre convention, as OpenCV and
+    the network use: a pixel centre x maps to ``(x + 0.5) * s - 0.5``, so cx does not simply scale)."""
+    K = np.array(K, dtype=np.float64).copy()
+    sx, sy = dst_hw[1] / src_hw[1], dst_hw[0] / src_hw[0]
+    K[0, 0] *= sx
+    K[1, 1] *= sy
+    K[0, 2] = (K[0, 2] + 0.5) * sx - 0.5
+    K[1, 2] = (K[1, 2] + 0.5) * sy - 0.5
+    return K
+
+
 def _mat(node, rows: Optional[int] = None, cols: Optional[int] = None) -> np.ndarray:
     if isinstance(node, dict) and "data" in node:
         a = np.asarray(node["data"], dtype=np.float64).reshape(int(node["rows"]), int(node["cols"]))
@@ -108,13 +120,11 @@ class StereoRig:
 
         src_hw = tuple(src_hw or self.eye_hw)
         _, (uw, uh), top, left, _ = letterbox_params(src_hw, net_hw)
-        sx, sy = uw / src_hw[1], uh / src_hw[0]
-        K = self.K_rect
-        K[0, 0] *= sx
-        K[0, 2] = K[0, 2] * sx + left
-        K[1, 1] *= sy
-        K[1, 2] = K[1, 2] * sy + top
-        return K, {"scale_xy": (sx, sy), "top": top, "left": left, "unpad_wh": (uw, uh)}
+        K = scale_K(self.K_rect, self.eye_hw, src_hw)  # the rectified image may already be a resized one
+        K = scale_K(K, src_hw, (uh, uw))
+        K[0, 2] += left
+        K[1, 2] += top
+        return K, {"scale_xy": (uw / src_hw[1], uh / src_hw[0]), "top": top, "left": left, "unpad_wh": (uw, uh)}
 
     def rectify_maps(self, out_hw: Sequence[int], eye: str = "left") -> Tuple[np.ndarray, np.ndarray]:
         """``cv2.remap`` maps from the raw eye image to the rectified image at ``out_hw`` (undistort + rectify +
@@ -125,9 +135,7 @@ class StereoRig:
         oh, ow = int(out_hw[0]), int(out_hw[1])
         K, D, Rr, P = ((self.K_left, self.D_left, self.R1, self.P1) if eye == "left" else
                        (self.K_right, self.D_right, self.R2, self.P2))
-        Kn = P[:, :3].copy()
-        Kn[0] *= ow / w
-        Kn[1] *= oh / h
+        Kn = scale_K(P[:, :3], (h, w), (oh, ow))
         return cv2.initUndistortRectifyMap(K, D, Rr, Kn, (ow, oh), cv2.CV_32FC1)
 
     # ------------------------------------------------------------------ field of view

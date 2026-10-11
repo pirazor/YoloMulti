@@ -155,8 +155,9 @@ class SparcDeploy(nn.Module):
         lwh = b3[..., 3:6].exp()
         if "K" in kw:
             K, T = kw["K"], kw["cam2ego"]
-            xc = (cxcywh[..., 0] - K[:, 0:1, 2]) / K[:, 0:1, 0] * depth
-            yc = (cxcywh[..., 1] - K[:, 1:2, 2]) / K[:, 1:2, 1] * depth
+            # boxes are in pixel-edge coordinates (x = 0 is the left image edge); K uses pixel centres (pixel i at i)
+            xc = (cxcywh[..., 0] - 0.5 - K[:, 0:1, 2]) / K[:, 0:1, 0] * depth
+            yc = (cxcywh[..., 1] - 0.5 - K[:, 1:2, 2]) / K[:, 1:2, 1] * depth
             p = torch.stack([xc, yc, depth], 1)  # (B, 3, N)
             e = T[:, :3, :3] @ p + T[:, :3, 3:4]
             x_ego, y_ego = e[:, 0], e[:, 1]
@@ -184,6 +185,20 @@ class SparcDeploy(nn.Module):
         return tuple(res)
 
 
+def ground_depth(K: torch.Tensor, cam2ego: torch.Tensor, hw: Sequence[int], max_z: float = 40.0) -> torch.Tensor:
+    """(B, 1, H, W) depth of the flat ground (ego z = 0) seen through ``K`` / ``cam2ego``; 0 above the horizon or
+    beyond ``max_z``. Pixel-centre convention (pixel (u, v) is the ray through K^-1 (u, v, 1))."""
+    b = K.shape[0]
+    h, w = hw
+    v, u = torch.meshgrid(torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij")
+    ray = torch.stack([(u[None] - K[:, 0, 2].view(-1, 1, 1)) / K[:, 0, 0].view(-1, 1, 1),
+                       (v[None] - K[:, 1, 2].view(-1, 1, 1)) / K[:, 1, 1].view(-1, 1, 1),
+                       torch.ones(b, h, w)], 1)  # (B, 3, H, W) camera-frame directions
+    rz = (cam2ego[:, 2, :3].view(b, 3, 1, 1) * ray).sum(1)  # ego z component of the direction
+    d = -cam2ego[:, 2, 3].view(b, 1, 1) / rz
+    return torch.where((rz < -1e-6) & (d < max_z), d, torch.zeros_like(d))[:, None]
+
+
 def example_inputs(net: SparcNet, until: str = "full", batch: int = 1, seed: int = 0,
                    K: Optional[torch.Tensor] = None, cam2ego: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
     """Plausible inputs for export / parity checks: a smooth image, a ground-plane depth map, a nominal camera."""
@@ -198,11 +213,7 @@ def example_inputs(net: SparcNet, until: str = "full", batch: int = 1, seed: int
     K = K.expand(batch, 3, 3).contiguous()
     T = (cam2ego if cam2ego is not None else torch.tensor(ground_cam2ego(1.4, 0.03), dtype=torch.float32))
     T = T.expand(batch, 4, 4).contiguous()
-    # depth of the ground plane below the horizon, 0 above it and beyond 40 m
-    v = torch.arange(h, dtype=torch.float32).view(1, 1, h, 1).expand(batch, 1, h, w)
-    fy, cy = K[:, 1, 1].view(-1, 1, 1, 1), K[:, 1, 2].view(-1, 1, 1, 1)
-    dz = fy * 1.4 / (v - cy).clamp(min=1e-3)
-    depth = torch.where((v > cy + 1) & (dz < 40), dz, torch.zeros_like(dz))
+    depth = ground_depth(K, T, (h, w), max_z=40.0)
     out = {"image": img, "K": K, "cam2ego": T, "depth": depth,
            "image_right": torch.roll(img, shifts=-4, dims=-1), "baseline": torch.full((batch, 1), 0.1)}
     return {k: out[k] for k in net.input_names(until)}

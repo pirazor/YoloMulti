@@ -32,7 +32,8 @@ def _bilinear_gather(value: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
             xi, yi = x0 + dx, y0 + dy
             wgt = (1 - (x - xi).abs()) * (1 - (y - yi).abs())
             valid = ((xi >= 0) & (xi <= w - 1) & (yi >= 0) & (yi <= h - 1)).to(value.dtype)
-            idx = (yi.clamp(0, h - 1) * w + xi.clamp(0, w - 1)).long().flatten(1)  # (N, Q*P)
+            # integer arithmetic: the float product exceeds fp16's exact range at the stride-8 level (3839 -> 3840)
+            idx = (yi.clamp(0, h - 1).to(torch.int32) * w + xi.clamp(0, w - 1).to(torch.int32)).long().flatten(1)  # (N, Q*P)
             g = torch.gather(flat, 2, idx[:, None, :].expand(n, c, q * p)).view(n, c, q, p)
             out = out + g * (wgt * valid)[:, None]
     return out

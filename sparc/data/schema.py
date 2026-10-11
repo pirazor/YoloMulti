@@ -236,12 +236,17 @@ class Sample:
             raise ValueError("label_mask.depth needs a depth_source")
         if (lm.bev_da or lm.bev_lane or lm.bev_agent) and self.bev is None:
             raise ValueError("a BEV label is set but bev is missing")
-        if lm.box3d and not np.isfinite(self.box3d).all(axis=1).any():
+        finite = np.isfinite(self.box3d)
+        if (finite.any(axis=1) & ~finite.all(axis=1)).any():
+            raise ValueError("a box3d row must be all finite (labelled) or all NaN (unlabelled)")
+        if lm.box3d and not finite.all(axis=1).any():
             raise ValueError("label_mask.box3d set but no box has a 3D label")
         if lm.track and self.clip_id is None:
             raise ValueError("track labels need a clip_id")
-        if (lm.lane_geom or lm.lane_order or lm.lane_dir) and not lm.lane_geom:
+        if (lm.lane_order or lm.lane_dir or lm.lane_cont or lm.lane_type) and not lm.lane_geom:
             raise ValueError("lane attributes need lane_geom")
+        if (lm.tl or lm.sign or lm.box3d or lm.track) and not lm.det:
+            raise ValueError("per-box labels (tl, sign, box3d, track) need det")
 
     # ------------------------------------------------------------------ I/O
     def save(self, path: str | Path) -> Path:

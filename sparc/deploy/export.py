@@ -63,51 +63,105 @@ def scatter_reductions(path: str | Path) -> List[str]:
 
 
 # --------------------------------------------------------------------------- comparison policies
+# Column roles of the table outputs: "coord" (box edges, pixels: matched by IoU), "score", "id" (argmax ids: compared by
+# agreement), "p" (probabilities), "val" (regressed values). Agents are matched to the reference by box IoU before
+# the columns are compared (fp16 can reorder near-tied top-k entries); lanes keep their slot order.
+AGENT_ROLES = ("coord",) * 4 + ("score", "id", "val", "val", "val", "val", "val", "val", "val", "val", "id", "p", "id", "p")
+LANE_META_ROLES = ("p", "id", "p", "id", "p", "id", "p", "id", "p")  # exist, order (value), p, dir, p, cont, p, type, p
+OUTPUT_POLICY = {"agents": "agents", "agent_emb": "rowset", "lane_meta": "lane_meta", "da": "label"}
+
+
+def policy_for(name: str) -> str:
+    return OUTPUT_POLICY.get(name, "dense")
+
+
+def _iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    x1 = np.maximum(a[:, None, 0], b[None, :, 0])
+    y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+    x2 = np.minimum(a[:, None, 2], b[None, :, 2])
+    y2 = np.minimum(a[:, None, 3], b[None, :, 3])
+    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
+    aa = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    ab = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    return inter / np.maximum(aa[:, None] + ab[None, :] - inter, 1e-9)
+
+
+def _columns(got: np.ndarray, ref: np.ndarray, roles) -> Dict[str, float]:
+    """Per-role agreement of two (N, C) tables whose rows correspond."""
+    out: Dict[str, float] = {}
+    for role in ("id", "p", "val", "score"):
+        cols = [i for i, r in enumerate(roles) if r == role]
+        if not cols:
+            continue
+        g, r = got[:, cols], ref[:, cols]
+        if role == "id":
+            out["id_agree"] = float((g == r).mean())
+        else:
+            out[f"{role}_max_abs"] = float(np.abs(g - r).max())
+            if role == "val":
+                out["val_rel_l2"] = float(np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-12))
+    return out
+
+
 def compare(name: str, got: np.ndarray, ref: np.ndarray, policy: str) -> Dict[str, float]:
     """Numerical agreement of one output under its policy.
 
     * ``dense``: relative L2 error ``|got - ref| / |ref|`` and max abs error;
     * ``label``: fraction of equal elements (class maps);
-    * ``ranked``: agents whose order comes from a top-k: compare the sorted score column (index 4) and the
-      fraction of the reference's top-50 boxes matched by IoU > 0.9 (fp16 can reorder near-ties);
-    * ``rowset``: per-agent vectors in top-k order (ID embeddings): fraction of reference rows that have a row in the
-      output within 5 % relative L2 distance, whatever its position.
+    * ``agents``: the reference's top-50 boxes (by score) are matched to output boxes by IoU > 0.9
+      (``top50_box_recall``); on the matched rows the id columns must agree and the probability / value / score
+      columns are compared numerically;
+    * ``lane_meta``: per slot, id columns by agreement, probability columns by max abs error;
+    * ``rowset``: per-agent vectors (ID embeddings): fraction of reference rows that have a row in the output within
+      5 % relative L2 distance, whatever its position.
     """
-    got = np.asarray(got, dtype=np.float64).reshape(ref.shape) if got.size == ref.size else np.asarray(got)
+    got = np.asarray(got, dtype=np.float64)
     ref = np.asarray(ref, dtype=np.float64)
-    if got.shape != ref.shape:
+    if got.size != ref.size:
         return {"shape_mismatch": 1.0}
+    got = got.reshape(ref.shape)
     if policy == "label":
         return {"agree": float((got == ref).mean())}
     if policy == "rowset":
         g, r = got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1])
         d = np.sqrt(((r[:, None, :] - g[None, :, :]) ** 2).sum(-1)).min(1) / (np.linalg.norm(r, axis=1) + 1e-12)
         return {"row_recall": float((d < 0.05).mean()), "row_rel_max": float(d.max())}
-    if policy == "ranked":
-        gs, rs = np.sort(got[..., 4].ravel())[::-1], np.sort(ref[..., 4].ravel())[::-1]
-        out = {"score_max_abs": float(np.abs(gs - rs).max())}
+    if policy == "lane_meta":
+        return _columns(got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1]), LANE_META_ROLES)
+    if policy == "agents":
         g, r = got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1])
-        top = r[np.argsort(-r[:, 4])[:50], :4]
-        out["top50_box_recall"] = float(np.mean([_best_iou(b, g[:, :4]) > 0.9 for b in top]))
+        top = np.argsort(-r[:, 4])[:50]
+        iou = _iou_matrix(r[top, :4], g[:, :4])
+        best = iou.argmax(1)
+        matched = iou[np.arange(len(top)), best] > 0.9
+        out = {"top50_box_recall": float(matched.mean())}
+        if matched.any():
+            out.update(_columns(g[best[matched]], r[top[matched]], AGENT_ROLES))
         return out
     den = np.linalg.norm(ref) + 1e-12
     return {"rel_l2": float(np.linalg.norm(got - ref) / den), "max_abs": float(np.abs(got - ref).max())}
 
 
-def _best_iou(b: np.ndarray, boxes: np.ndarray) -> float:
-    x1, y1 = np.maximum(b[0], boxes[:, 0]), np.maximum(b[1], boxes[:, 1])
-    x2, y2 = np.minimum(b[2], boxes[:, 2]), np.minimum(b[3], boxes[:, 3])
-    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
-    a = (b[2] - b[0]) * (b[3] - b[1])
-    ab = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-    return float((inter / np.maximum(a + ab - inter, 1e-9)).max()) if len(boxes) else 0.0
+# thresholds: (key, limit, "min" | "max")
+PARITY_LIMITS_ORT = (("rel_l2", 1e-3, "max"), ("agree", 0.999, "min"), ("top50_box_recall", 0.98, "min"),
+                     ("row_recall", 0.98, "min"), ("id_agree", 0.99, "min"), ("p_max_abs", 1e-2, "max"),
+                     ("score_max_abs", 1e-2, "max"), ("val_rel_l2", 1e-2, "max"))
+PARITY_LIMITS_FP16 = (("rel_l2", 0.05, "max"), ("agree", 0.97, "min"), ("top50_box_recall", 0.8, "min"),
+                      ("row_recall", 0.8, "min"), ("id_agree", 0.9, "min"), ("p_max_abs", 0.1, "max"),
+                      ("score_max_abs", 0.05, "max"), ("val_rel_l2", 0.05, "max"))
 
 
-OUTPUT_POLICY = {"agents": "ranked", "agent_emb": "rowset", "da": "label"}
-
-
-def policy_for(name: str) -> str:
-    return OUTPUT_POLICY.get(name, "dense")
+def parity_failures(metrics: Dict[str, Dict[str, float]], limits=PARITY_LIMITS_FP16) -> List[str]:
+    """Human-readable violations of ``limits`` (empty = parity ok)."""
+    bad = []
+    for name, m in metrics.items():
+        if m.get("shape_mismatch") or m.get("missing"):
+            bad.append(f"{name}: missing or wrong shape")
+            continue
+        for key, lim, kind in limits:
+            if key in m and ((kind == "max" and not m[key] <= lim) or (kind == "min" and not m[key] >= lim)):
+                bad.append(f"{name}: {key} {m[key]:.3g} ({'>' if kind == 'max' else '<'} {lim})")
+    return bad
 
 
 # --------------------------------------------------------------------------- export
@@ -144,10 +198,9 @@ def run_ort(path: str | Path, inputs: Dict[str, np.ndarray], runs: int = 0, thre
 
 def export_graph(module: nn.Module, inputs: Dict[str, torch.Tensor], path: str | Path, output_names: Sequence[str],
                  opset: int = 17, simplify: bool = True, check: bool = True, cpu_runs: int = 0,
-                 tol: Dict[str, float] | None = None) -> ExportInfo:
-    """Export ``module(*inputs.values())`` with static shapes; verify against PyTorch with onnxruntime.
-
-    ``tol``: max ``rel_l2`` per dense output (default 1e-3) / min agreement for labels (0.999)."""
+                 limits=None) -> ExportInfo:
+    """Export ``module(*inputs.values())`` with static shapes; verify against PyTorch with onnxruntime
+    (``limits`` default :data:`PARITY_LIMITS_ORT`)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     module = module.eval()
@@ -171,19 +224,9 @@ def export_graph(module: nn.Module, inputs: Dict[str, torch.Tensor], path: str |
     if check or cpu_runs:
         np_in = {k: v.numpy() for k, v in inputs.items()}
         got, info.ort_cpu_ms = run_ort(path, np_in, runs=cpu_runs)
-        tol = tol or {}
-        bad = []
         for name, w in zip(output_names, want):
-            m = compare(name, got[name], w.numpy(), policy_for(name))
-            info.parity[name] = m
-            if "rel_l2" in m and m["rel_l2"] > tol.get(name, 1e-3):
-                bad.append(f"{name}: rel_l2 {m['rel_l2']:.2e}")
-            if "agree" in m and m["agree"] < tol.get(name, 0.999):
-                bad.append(f"{name}: agreement {m['agree']:.4f}")
-            if "top50_box_recall" in m and m["top50_box_recall"] < tol.get(name, 0.98):
-                bad.append(f"{name}: top-50 box recall {m['top50_box_recall']:.2f}")
-            if "row_recall" in m and m["row_recall"] < tol.get(name, 0.98):
-                bad.append(f"{name}: row recall {m['row_recall']:.2f}")
+            info.parity[name] = compare(name, got[name], w.numpy(), policy_for(name))
+        bad = parity_failures(info.parity, limits or PARITY_LIMITS_ORT)
         if check and bad:
             raise ExportParityError(f"{path.name}: ONNX does not reproduce PyTorch: " + "; ".join(bad))
     return info

@@ -54,6 +54,9 @@ def test_sample_without_optional_parts_round_trips(tmp_path):
     (dict(licence="cc"), "licence"),
     (dict(image_right="r.jpg"), "image_right and baseline_m"),
     (dict(label_mask=LabelMask(det=True, cls_vocab=[9])), "cls_vocab"),
+    (dict(label_mask=LabelMask(lane_geom=False, lane_type=True)), "lane attributes need lane_geom"),
+    (dict(label_mask=LabelMask(tl=True)), "need det"),
+    (dict(box3d=[[12.0, 0.1, 4.5, 1.8, 1.5, np.nan, -1.0], [np.nan] * 7]), "all finite"),
 ])
 def test_sample_validation(kw, msg):
     with pytest.raises(ValueError, match=msg):
@@ -99,6 +102,11 @@ def test_example_rig_geometry():
     Kn, lb = r.network_K((384, 640))
     assert lb["unpad_wh"][1] == 384 and lb["left"] > 0
     assert Kn[0, 0] == pytest.approx(r.P1[0, 0] * lb["scale_xy"][0])
+    sx = lb["scale_xy"][0]
+    assert Kn[0, 2] == pytest.approx((r.P1[0, 2] + 0.5) * sx - 0.5 + lb["left"])  # pixel-centre convention
+    # a rectified image already resized to 720x450 gives the same network K
+    Kn2, _ = r.network_K((384, 640), src_hw=(450, 720))
+    np.testing.assert_allclose(Kn2, Kn, atol=1e-9)
     # depth error grows with Z^2 and shrinks with resolution
     t = r.depth_table(640, ranges_m=(10, 20))
     e10, e20 = (row["err_m"][0.25] for row in t["rows"])
@@ -107,18 +115,37 @@ def test_example_rig_geometry():
     assert "rectified baseline" in r.report()
 
 
+def test_scale_K_matches_cv2_resize():
+    """A blob at pixel-centre x in a 1440-wide image lands where scale_K predicts after cv2.resize (half-pixel rule)."""
+    import cv2
+
+    from sparc.rig.stereo import scale_K
+
+    img = np.zeros((90, 144), np.float32)
+    x0, y0 = 100.0, 40.0
+    yy, xx = np.mgrid[:90, :144]
+    img[:] = np.exp(-((xx - x0) ** 2 + (yy - y0) ** 2) / (2 * 3.0 ** 2))
+    small = cv2.resize(img, (64, 40), interpolation=cv2.INTER_AREA)
+    yy2, xx2 = np.mgrid[:40, :64]
+    cx, cy = (small * xx2).sum() / small.sum(), (small * yy2).sum() / small.sum()
+    K = np.array([[500.0, 0, x0], [0, 500.0, y0], [0, 0, 1]])
+    Ks = scale_K(K, (90, 144), (40, 64))
+    assert abs(Ks[0, 2] - cx) < 0.05 and abs(Ks[1, 2] - cy) < 0.05
+    assert Ks[0, 2] != pytest.approx(x0 * 64 / 144, abs=0.1)  # naive scaling is 0.28 px off here
+
+
 def test_rectify_maps_agree_with_projection():
     """A 3D point projected with the raw model lands, after remapping, where the rectified K puts it."""
     import cv2
+
+    from sparc.rig.stereo import scale_K
 
     r = StereoRig.from_yaml(CALIB)
     out_hw = (450, 720)
     mx, my = r.rectify_maps(out_hw)
     X = np.array([[0.8, 0.3, 6.0]])
     # rectified pixel at out_hw
-    Kn = r.K_rect.copy()
-    Kn[0] *= out_hw[1] / r.eye_hw[1]
-    Kn[1] *= out_hw[0] / r.eye_hw[0]
+    Kn = scale_K(r.K_rect, r.eye_hw, out_hw)
     p_rect = Kn @ (r.R1 @ X.T)
     u, v = (p_rect[:2] / p_rect[2]).ravel()
     # the map at that pixel must point at the raw projection of X

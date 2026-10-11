@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sparc.deploy.export import export_graph, policy_for
+from sparc.deploy.export import PARITY_LIMITS_FP16, export_graph, parity_failures, policy_for
 from sparc.nn.model import STAGES, SparcCfg, SparcDeploy, SparcNet, example_inputs
 
 LOG = logging.getLogger("sparc.bakeoff")
@@ -218,22 +218,8 @@ def export_bundle(out: str | Path, backbones: Sequence[str], imgsz=(384, 640), s
 
 
 # --------------------------------------------------------------------------- report
-FP16_LIMITS = {"rel_l2": 0.05, "agree": 0.97, "top50_box_recall": 0.8, "row_recall": 0.8}
-
-
 def parity_ok(metrics: Dict[str, Dict[str, float]]) -> bool:
-    for m in metrics.values():
-        if m.get("shape_mismatch") or m.get("missing"):
-            return False
-        if "rel_l2" in m and not m["rel_l2"] <= FP16_LIMITS["rel_l2"]:
-            return False
-        if "agree" in m and m["agree"] < FP16_LIMITS["agree"]:
-            return False
-        if "top50_box_recall" in m and m["top50_box_recall"] < FP16_LIMITS["top50_box_recall"]:
-            return False
-        if "row_recall" in m and m["row_recall"] < FP16_LIMITS["row_recall"]:
-            return False
-    return True
+    return not parity_failures(metrics, PARITY_LIMITS_FP16)
 
 
 def report(out: str | Path) -> str:
@@ -247,7 +233,7 @@ def report(out: str | Path) -> str:
         res = json.loads(rf.read_text())
         by = {r["name"]: r for r in res["results"]}
         dev = res.get("device", {})
-        lines += [f"## {res['precision'].upper()} on {dev.get('model', '?')} (TensorRT {dev.get('tensorrt', '?')})", "",
+        lines += [f"## {res['precision'].upper()} on {dev.get('model', '?')} (TensorRT {res.get('tensorrt') or '?'})", "",
                   "| backbone | backbone ms | rest ms | full ms | GFLOPs | params M | fp16 parity |", "|---|---|---|---|---|---|---|"]
         cands = [m for m in manifest["models"] if m["kind"] == "candidate"]
         for b in dict.fromkeys(m["backbone"] for m in cands):

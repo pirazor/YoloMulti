@@ -31,12 +31,14 @@ FAKE_TRTEXEC = textwrap.dedent(r'''
     out = []
     for k, v in m["outputs"].items():
         ref = np.load(root / v["ref"])
+        if name == "probe_msda_gather":
+            ref = ref.copy(); ref.flat[0] = float("nan")
         if v["policy"] == "dense" and "noisy" in sys.argv[0]:
             ref = ref + rng.normal(0, 0.2, ref.shape) * (np.abs(ref).mean() + 1e-6)
         elif v["policy"] == "dense":
             ref = ref * (1 + rng.normal(0, 1e-3, ref.shape))
         out.append({"name": k, "dimensions": "x".join(map(str, ref.shape)), "values": ref.ravel().tolist()})
-    Path(args["exportOutput"]).write_text(json.dumps(out))
+    Path(args["exportOutput"]).write_text(json.dumps(out).replace("NaN", "-nan"))  # trtexec prints -nan / inf
     print("[I] TensorRT version: 10.3.0")
     print("[I] Engine built in 12.5 sec.")
     print("[I] Latency: min = 2.0 ms, max = 3.0 ms, mean = 2.5 ms, median = 2.4 ms, percentile(90%) = 2.8 ms, percentile(95%) = 2.9 ms, percentile(99%) = 3.0 ms")
@@ -91,12 +93,15 @@ def test_device_runner_with_fake_trtexec(bundle, tmp_path):
     assert ok["parity_ok"] and ok["parity"]["da"]["agree"] == 1.0 and ok["parity"]["agents"]["top50_box_recall"] == 1.0
     bad = by["probe_splat_scatter_add"]
     assert not bad["built"] and "ScatterElements" in bad["error"]
+    nan = by["probe_msda_gather"]  # a NaN in the export is parsed, fails parity, and does not stop the run
+    assert nan["built"] and nan["parity_ok"] is False and len(res["results"]) == len(json.loads((bundle / "manifest.json").read_text())["models"])
     md = (tmp_path / "res" / "results_fp16.md").read_text()
     assert "| probe_splat_scatter_add | NO |" in md
     # the CLI report reads results next to the manifest
     (bundle / "results_fp16.json").write_text(json.dumps(res))
     rep = report(bundle)
     assert "| vit_t16_dinov3 | 1.80 | 0.00 | 1.80 |" in rep and "| probe_splat_scatter_add | NO |" in rep
+    assert "TensorRT 10.3.0" in rep
 
 
 def test_device_runner_flags_numerical_drift(bundle, tmp_path):
@@ -112,6 +117,7 @@ def test_runner_and_library_compare_agree():
     """run_on_device.py duplicates the comparison (no sparc import on the device): keep them identical."""
     sys.path.insert(0, str(Path(__file__).parents[2] / "sparc" / "tools"))
     import run_on_device as dev
+    from sparc.deploy import export as export_mod
     from sparc.deploy.export import compare
 
     rng = np.random.default_rng(0)
@@ -122,10 +128,28 @@ def test_runner_and_library_compare_agree():
     perm = emb[:, rng.permutation(200)]
     assert dev.compare(perm, emb, "rowset") == compare("agent_emb", perm, emb, "rowset")
     assert compare("agent_emb", perm, emb, "rowset")["row_recall"] == 1.0
-    for policy in ("dense", "ranked"):
+    for policy in ("dense", "agents"):
         a, b = dev.compare(got, ref, policy), compare("x", got, ref, policy)
         assert a.keys() == b.keys() and all(abs(a[k] - b[k]) < 1e-12 for k in a)
     lab = rng.integers(0, 3, (1, 32, 48))
     assert dev.compare(lab, lab, "label") == compare("da", lab, lab, "label") == {"agree": 1.0}
-    assert dev.LIMITS == __import__("sparc.tools.bakeoff", fromlist=["FP16_LIMITS"]).FP16_LIMITS
+    from sparc.deploy.export import PARITY_LIMITS_FP16
+
+    assert tuple(dev.LIMITS) == tuple(PARITY_LIMITS_FP16) and dev.AGENT_ROLES == export_mod.AGENT_ROLES
     assert parity_ok({"x": {"rel_l2": 0.01}}) and not parity_ok({"x": {"rel_l2": 0.5}})
+    # agents: a reordered, fp16-noisy table with one flipped sign id is still matched row by row
+    ag = rng.random((1, 200, 18)); ag[..., 2:4] += ag[..., 0:2] + 0.5
+    ag[..., 5] = rng.integers(0, 10, (1, 200)); ag[..., 14] = rng.integers(0, 4, (1, 200)); ag[..., 16] = rng.integers(0, 401, (1, 200))
+    p2 = ag[:, rng.permutation(200)].copy()
+    p2[0, 0, 16] += 1  # one wrong sign id among the top-50 rows (or not; depends on where row 0 ranks)
+    m = compare("agents", p2, ag, "agents")
+    assert m == dev.compare(p2, ag, "agents") and m["top50_box_recall"] == 1.0 and m["val_rel_l2"] == 0.0 and m["id_agree"] >= 0.99
+    lm = rng.random((1, 24, 9)); lm[..., [1, 3, 5, 7]] = rng.integers(0, 3, (1, 24, 4))
+    lm2 = lm.copy(); lm2[0, 0, 7] += 1
+    m = compare("lane_meta", lm2, lm, "lane_meta")
+    assert m == dev.compare(lm2, lm, "lane_meta") and m["id_agree"] == pytest.approx(1 - 1 / 96) and m["p_max_abs"] == 0.0
+    # trtexec writes nan / -nan / inf in its JSON export
+    f = Path(__import__("tempfile").mkdtemp()) / "o.json"
+    f.write_text('[{"name": "x", "dimensions": "3", "values": [1.5, -nan, inf]}, {"name": "y", "dimensions": "1", "values": [-inf]}]')
+    got = dev.read_export(f)
+    assert np.isnan(got["x"][1]) and np.isposinf(got["x"][2]) and np.isneginf(got["y"][0]) and got["x"][0] == 1.5

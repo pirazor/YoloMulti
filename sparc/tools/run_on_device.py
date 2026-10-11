@@ -58,14 +58,40 @@ def device_info() -> dict:
     return info
 
 
-# ------------------------------------------------------------------ comparison (mirrors sparc.deploy.export.compare)
-def _best_iou(b, boxes):
-    x1, y1 = np.maximum(b[0], boxes[:, 0]), np.maximum(b[1], boxes[:, 1])
-    x2, y2 = np.minimum(b[2], boxes[:, 2]), np.minimum(b[3], boxes[:, 3])
+# ------------------------------------------------------------------ comparison (mirrors sparc.deploy.export)
+# Keep identical to sparc/deploy/export.py (tests/test_sparc/test_bakeoff.py checks both agree).
+AGENT_ROLES = ("coord",) * 4 + ("score", "id", "val", "val", "val", "val", "val", "val", "val", "val", "id", "p", "id", "p")
+LANE_META_ROLES = ("p", "id", "p", "id", "p", "id", "p", "id", "p")
+LIMITS = (("rel_l2", 0.05, "max"), ("agree", 0.97, "min"), ("top50_box_recall", 0.8, "min"),
+          ("row_recall", 0.8, "min"), ("id_agree", 0.9, "min"), ("p_max_abs", 0.1, "max"),
+          ("score_max_abs", 0.05, "max"), ("val_rel_l2", 0.05, "max"))
+
+
+def _iou_matrix(a, b):
+    x1 = np.maximum(a[:, None, 0], b[None, :, 0])
+    y1 = np.maximum(a[:, None, 1], b[None, :, 1])
+    x2 = np.minimum(a[:, None, 2], b[None, :, 2])
+    y2 = np.minimum(a[:, None, 3], b[None, :, 3])
     inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
-    a = (b[2] - b[0]) * (b[3] - b[1])
-    ab = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-    return float((inter / np.maximum(a + ab - inter, 1e-9)).max()) if len(boxes) else 0.0
+    aa = (a[:, 2] - a[:, 0]) * (a[:, 3] - a[:, 1])
+    ab = (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1])
+    return inter / np.maximum(aa[:, None] + ab[None, :] - inter, 1e-9)
+
+
+def _columns(got, ref, roles):
+    out = {}
+    for role in ("id", "p", "val", "score"):
+        cols = [i for i, r in enumerate(roles) if r == role]
+        if not cols:
+            continue
+        g, r = got[:, cols], ref[:, cols]
+        if role == "id":
+            out["id_agree"] = float((g == r).mean())
+        else:
+            out[f"{role}_max_abs"] = float(np.abs(g - r).max())
+            if role == "val":
+                out["val_rel_l2"] = float(np.linalg.norm(g - r) / (np.linalg.norm(r) + 1e-12))
+    return out
 
 
 def compare(got, ref, policy):
@@ -79,33 +105,46 @@ def compare(got, ref, policy):
         g, r = got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1])
         d = np.sqrt(((r[:, None, :] - g[None, :, :]) ** 2).sum(-1)).min(1) / (np.linalg.norm(r, axis=1) + 1e-12)
         return {"row_recall": float((d < 0.05).mean()), "row_rel_max": float(d.max())}
-    if policy == "ranked":
-        gs, rs = np.sort(got[..., 4].ravel())[::-1], np.sort(ref[..., 4].ravel())[::-1]
+    if policy == "lane_meta":
+        return _columns(got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1]), LANE_META_ROLES)
+    if policy == "agents":
         g, r = got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1])
-        top = r[np.argsort(-r[:, 4])[:50], :4]
-        return {"score_max_abs": float(np.abs(gs - rs).max()),
-                "top50_box_recall": float(np.mean([_best_iou(b, g[:, :4]) > 0.9 for b in top]))}
+        top = np.argsort(-r[:, 4])[:50]
+        iou = _iou_matrix(r[top, :4], g[:, :4])
+        best = iou.argmax(1)
+        matched = iou[np.arange(len(top)), best] > 0.9
+        out = {"top50_box_recall": float(matched.mean())}
+        if matched.any():
+            out.update(_columns(g[best[matched]], r[top[matched]], AGENT_ROLES))
+        return out
     return {"rel_l2": float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-12)), "max_abs": float(np.abs(got - ref).max())}
 
 
-def parity_ok(metrics):
-    for m in metrics.values():
+def parity_failures(metrics, limits=LIMITS):
+    bad = []
+    for name, m in metrics.items():
         if m.get("shape_mismatch") or m.get("missing"):
-            return False
-        if "rel_l2" in m and not m["rel_l2"] <= LIMITS["rel_l2"]:
-            return False
-        if "agree" in m and m["agree"] < LIMITS["agree"]:
-            return False
-        if "top50_box_recall" in m and m["top50_box_recall"] < LIMITS["top50_box_recall"]:
-            return False
-        if "row_recall" in m and m["row_recall"] < LIMITS["row_recall"]:
-            return False
-    return True
+            bad.append(f"{name}: missing or wrong shape")
+            continue
+        for key, lim, kind in limits:
+            if key in m and ((kind == "max" and not m[key] <= lim) or (kind == "min" and not m[key] >= lim)):
+                bad.append(f"{name}: {key} {m[key]:.3g} ({'>' if kind == 'max' else '<'} {lim})")
+    return bad
+
+
+def parity_ok(metrics):
+    return not parity_failures(metrics)
+
+
+NONFINITE_RE = re.compile(r"(?<![\w.])(-?)(nan|inf)(?![\w.])", re.IGNORECASE)
 
 
 def read_export(path: Path) -> dict:
-    data = json.loads(path.read_text())
-    return {d["name"]: np.asarray(d["values"]) for d in data}
+    """trtexec --exportOutput JSON; its float printer writes nan / -nan / inf, which strict JSON parsers refuse."""
+    text = path.read_text()
+    text = NONFINITE_RE.sub(lambda m: "NaN" if m.group(2).lower() == "nan" else m.group(1) + "Infinity", text)
+    data = json.loads(text)
+    return {d["name"]: np.asarray(d["values"], dtype=np.float64) for d in data}
 
 
 # ------------------------------------------------------------------ one graph
@@ -168,7 +207,7 @@ def to_markdown(res: dict) -> str:
         par = "-" if "parity" not in r else ("ok" if r["parity_ok"] else "FAIL")
         note = r.get("error", "")
         if r.get("parity") and not r["parity_ok"]:
-            note = "; ".join(f"{k}: {v}" for k, v in r["parity"].items())[:200]
+            note = "; ".join(parity_failures(r["parity"]))[:300]
         lines.append(f"| {r['name']} | {'yes' if r['built'] else 'NO'} | {ms} | {p99} | {par} | {note} |")
     return "\n".join(lines) + "\n"
 
@@ -194,8 +233,12 @@ def main(argv=None) -> int:
            "results": []}
     for i, m in enumerate(models, 1):
         print(f"[{i}/{len(models)}] {m['name']} ...", flush=True)
-        r = run_one(m, a, trtexec, out_dir)
-        res.setdefault("tensorrt", r.get("tensorrt"))
+        try:
+            r = run_one(m, a, trtexec, out_dir)
+        except Exception as e:  # noqa: BLE001 - one broken graph must not stop the others
+            r = {"name": m["name"], "kind": m.get("kind"), "built": False, "error": f"{type(e).__name__}: {e}"[:300]}
+        if r.get("tensorrt") and not res.get("tensorrt"):
+            res["tensorrt"] = r["tensorrt"]
         res["results"].append(r)
         msg = f"   built={r['built']}"
         if r.get("gpu_median_ms") is not None:

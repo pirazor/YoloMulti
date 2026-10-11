@@ -139,6 +139,23 @@ def test_splat_puts_ground_pixels_at_their_ground_point():
     assert (cells[0] - gx).mean().abs() < 0.05  # no systematic range bias
 
 
+def test_example_depth_follows_the_pose_and_ipm_survives_fp16_ranges():
+    from sparc.nn.model import ground_depth
+
+    T = ground_cam2ego(1.4, 0.03)
+    d = ground_depth(K, torch.tensor(T, dtype=torch.float32)[None], (H, W))
+    torch.testing.assert_close(d, _ground_depth(T), atol=1e-3, rtol=1e-4)
+    # a level camera projects near cells to |u| ~ 1e5: the IPM grid must stay finite and masked
+    T0 = torch.tensor(ground_cam2ego(1.4, 0.0), dtype=torch.float32)[None]
+    ipm = IPMSampler(c_in=1, c=1)
+    ipm.reduce = nn.Identity()
+    out = ipm(torch.ones(1, 1, H // 8, W // 8), K, T0)
+    assert torch.isfinite(out).all() and out[0, 1].sum() > 100
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out16 = ipm(torch.ones(1, 1, H // 8, W // 8), K, T0)
+    assert torch.isfinite(out16).all()
+
+
 def test_gwc_volume_peaks_at_the_true_disparity():
     torch.manual_seed(1)
     fl = torch.randn(1, 64, 8, 40)
@@ -173,9 +190,9 @@ def test_sparc_deploy_contract_and_ego_position():
     a = outs["agents"][0]
     assert (a[:, 2] > a[:, 0]).all() and (a[:, 4] >= 0).all() and (a[:, 4] <= 1).all()
     assert set(outs["lane_meta"][0, :, 1].tolist()) <= {-3.0, -2.0, -1.0, 1.0, 2.0, 3.0}
-    # x_ego / y_ego is the box centre back-projected at the predicted depth
+    # x_ego / y_ego is the box centre (pixel-edge coordinates) back-projected at the predicted depth
     Kc, T = inp["K"][0], inp["cam2ego"][0]
-    cx, cy, z = (a[0, 0] + a[0, 2]) / 2, (a[0, 1] + a[0, 3]) / 2, a[0, 6]
+    cx, cy, z = (a[0, 0] + a[0, 2]) / 2 - 0.5, (a[0, 1] + a[0, 3]) / 2 - 0.5, a[0, 6]
     p = torch.stack([(cx - Kc[0, 2]) / Kc[0, 0] * z, (cy - Kc[1, 2]) / Kc[1, 1] * z, z])
     e = T[:3, :3] @ p + T[:3, 3]
     assert a[0, 12].item() == pytest.approx(e[0].item(), rel=1e-4) and a[0, 13].item() == pytest.approx(e[1].item(), abs=1e-4)
