@@ -10,9 +10,25 @@ The previous YOLOv13-based implementation lives in [`legacy/yolov13/`](legacy/yo
 (tag `yolov13-mt-baseline`) and is kept as the A0 baseline for ablations.
 
 ```
-adas_mt/        new package (data, nn, distill, engine, export, deploy)
+sparc/          next-generation network (design: docs/sparc/plan.md), Phase 0: bake-off tooling, rig geometry, schema
+adas_mt/        YOLO26-based multi-task model (data, nn, distill, engine, export, deploy); the A0 baseline for SPARC
 sign_classifier/ fine-grained traffic-sign classifier (unchanged)
+recording/      recording specification for own drives (any stereo + IMU + GNSS rig)
 legacy/yolov13/ previous YOLOv13 multi-task implementation (frozen baseline)
+```
+
+## SPARC (in progress)
+
+One sparse-query network for a stereo camera + IMU + GNSS on a Jetson Orin: road users with 3D state and
+tracking embeddings, traffic-light colour and fine sign class, lanes with ego order and travel direction,
+drivable area, and a depth-grounded BEV map ([design](docs/sparc/plan.md)). Phase 0
+([report](docs/sparc/phase0.md)) measures the backbone candidates and the TensorRT-critical ops on the device:
+
+```bash
+python -m sparc rig --calib stereo_calib.yaml --baseline 0.10   # FOV, network intrinsics, depth precision vs range
+python -m sparc profile --stereo                                # params / GFLOPs per component and candidate
+python -m sparc bakeoff export --out runs/bakeoff               # then on the Jetson: python3 runs/bakeoff/run_on_device.py
+python -m sparc bakeoff report --out runs/bakeoff
 ```
 
 ## Train on Google Colab

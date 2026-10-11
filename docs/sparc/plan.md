@@ -1,4 +1,4 @@
-<!-- Status: DESIGN PROPOSAL for review (2026-10-11). Supersedes the YOLO26-based plan. Nothing in this document is implemented yet; Phase 0 starts only after review. -->
+<!-- Status: design approved 2026-10-11; Phase 0 implemented (see docs/sparc/phase0.md), on-device bake-off pending. Supersedes the YOLO26-based plan. Section 0 records what Phase 0 changed. -->
 
 # SPARC: one sparse-query perception network for the Jetson Orin Nano Super
 
@@ -7,7 +7,7 @@
 The merged `adas_mt` model is a YOLO26 CNN with two segmentation heads. The user rejected it: it is an
 adaptation of an existing detector, it cannot grow into the required system, and YOLO26 is no longer the
 accuracy/latency frontier. The required system (decided in Q&A on 2026-10-11) is a **single network** for a
-front camera + depth camera + IMU + GPS on an **Orin Nano Super at ≤ 33 ms (FP16 TensorRT, 384×640)** that outputs:
+front stereo camera (depth from stereo) + IMU + GPS on an **Orin Nano Super at ≤ 33 ms (FP16 TensorRT, 384×640)** that outputs:
 
 1. road users: detection + tracking + **vehicle 3D state** (position/depth, yaw, size);
 2. traffic-light colour and **fine traffic-sign class** (Mapillary TSD, ~400 classes) in the same pass;
@@ -18,6 +18,34 @@ front camera + depth camera + IMU + GPS on an **Orin Nano Super at ≤ 33 ms (FP
 Datasets: BDD100K, CULane, Mapillary Traffic Sign Dataset (MTSD), nuScenes front camera (3D boxes, LiDAR depth,
 HD-map BEV labels), and the user's own drives (no recordings yet; a recording protocol is a deliverable).
 Training: one A100/H100-class GPU for days. Target branch `multitask`; the old plan below this line is superseded.
+
+## 0. Phase-0 update: the sensor is a stereo pair, so depth costs compute
+
+The "depth camera" is a stereo pair (the example rig: global-shutter eyes, 1440x900 crops, 99.8 mm baseline). Four
+consequences, measured with `python -m sparc rig` on the example calibration (`docs/sparc/phase0.md`):
+
+1. **Depth is not a free input.** A separate foundation stereo engine costs ~55 ms per frame on an Orin NX at
+   320x320, more than the whole budget. Runtime depth options, decided by the Phase-0 device run and the Phase-3
+   accuracy ablation: **D1** the in-network stereo head (`sparc/nn/stereo.py`: the right eye costs a 4-conv stem, a
+   48-level group-wise correlation volume and convex upsampling, ~5.6 GFLOPs), **D2** an external stereo engine on a
+   second stream, **D3** no runtime stereo (IPM + learned depth cues only). The engine contract supports both a
+   `depth` input (D2, or LiDAR during training) and `image_right` + `baseline` inputs (D1).
+2. **Depth precision is range-limited**: error < 10 % (0.25 px disparity error) to ~53 m at full eye width, ~24 m at
+   the 640-px network width, ~12 m at 320 px. Training depth labels therefore come from a large stereo model run
+   **offline at full resolution** on recorded raw pairs (a second, legitimate teacher use case), and the BEV beyond
+   ~25 m is supervised by **future-near accumulation**: a region 40 m ahead is labelled from the later frames in
+   which it is 5-10 m ahead, moved back with the recorded ego-motion (`recording/protocol.md` section 7).
+3. **The perception input is the rectified left eye**: depth lives in the rectified frame; on the example rig the
+   rectified and raw left images differ by a 1.5x focal length, so mixing them misplaces every depth sample.
+   Rectification with `alpha = 0` cuts the horizontal FOV from 78 to 57 deg; `alpha ~0.5` keeps ~83 deg. Raw
+   pairs are recorded, so the choice stays open.
+4. **Splat geometry**: taking the nearest depth of a stride-8 block biased ground points towards the camera by
+   ~1 m at 10 m; the splat now uses stride-4 points with the mean valid depth of each 4x4 block (unit-tested: no
+   range bias on a flat ground).
+
+Measured shared-part cost at 384x640 after slimming to real-time-DETR widths: encoder 8.0, decoder 4.4, drivable
+area 1.2, BEV 6.1, stereo head 5.6 GFLOPs; backbones 7.5 (YOLO26s reference) to 44 GFLOPs (ViT-S, ConvNeXt-T).
+The rig code is generic (any OpenCV stereo calibration); the recording specification is written for any recorder.
 
 ## What the research says (Oct 2026, sources in the chat log)
 
@@ -58,7 +86,7 @@ RGB 384×640 ──► foundation backbone (DINOv2/3, Phase-0 bake-off) ──�
                            │                               │
   dense heads: drivable area (stride 8), lane aux mask     │  3D states ──► rendered agent footprints
                            │                               ▼
-  depth map + IMU extrinsics ──► KNOWN-DEPTH SPLAT (image features → BEV cells, measured depth;
+  stereo depth (in-network head or input) + K + cam2ego ──► DEPTH SPLAT (image features → BEV cells;
                                  learned ground-plane branch where depth is missing) ──► BEV decoder
                                  ──► BEV drivable area, BEV lane lines + heading, agent footprints
 ```
@@ -70,9 +98,10 @@ Key decisions:
 - **One decoder, typed queries**: the same deformable cross-attention serves agents and lanes; only the query sets,
   heads and matching differ. Tracking v1 = ID embeddings + 3D positions matched in post-processing (MOTIP-style ID
   loss on BDD100K MOT clips); v2 = one-frame track-query memory.
-- **Known-depth splat BEV**: no learned per-pixel depth distribution (LSS) — the depth camera gives metric depth, so
-  features are splatted with a per-frame BEV index table (gather/scatter, TensorRT-safe); a learned IPM branch covers
-  pixels without depth. On nuScenes the LiDAR projection stands in for the depth camera during training.
+- **Depth-grounded splat BEV**: no learned per-pixel depth distribution (LSS) — metric stereo depth (section 0) places
+  features with a per-frame BEV index (ScatterElements-add, TensorRT-safe if the Phase-0 probe passes); a learned
+  IPM branch covers cells without depth. On monocular sources (nuScenes) LiDAR depth is fed through the `depth`
+  input during training.
 - **Supervision without manual BEV/3D labels on the user's rig**: nuScenes pretrains the 3D and BEV heads; the
   user's drives provide depth-derived positions, tracking-derived headings and **self-generated BEV labels**
   (perspective labels lifted by measured depth, accumulated over time with GPS/IMU ego-motion, rasterised).
@@ -282,8 +311,9 @@ per output.
 ## 5. Deployment layer
 
 **Engine contract** (`sparc/deploy/export.py`; meta JSON as today). Inputs: `image` f32 (1,3,384,640) RGB/255
-letterboxed; `depth` f32 (1,1,384,640) in m, letterboxed nearest, pad 0; `intrinsics` f32 (1,3,3) at network pixels
-(letterbox-adjusted); `cam2ego` f32 (1,4,4). Outputs: `agents` f32 (1,200,18) = xyxy, score, cls, depth, sin, cos,
+letterboxed rectified left eye; `K` f32 (1,3,3) at network pixels (letterbox-adjusted); `cam2ego` f32 (1,4,4); then
+either `depth` f32 (1,1,384,640) in m, letterboxed nearest, pad 0 (D2, or any external depth), or `image_right` f32
+(1,3,384,640) + `baseline` f32 (1,1) in m (D1, in-network stereo, which also outputs `depth`). Outputs: `agents` f32 (1,200,18) = xyxy, score, cls, depth, sin, cos,
 l, w, h, x_ego, y_ego, tl_id, tl_p, sign_id, sign_p; `agent_emb` f16 (1,200,64); `lane_xs`/`lane_vis` f32 (1,24,72);
 `lane_meta` f32 (1,24,9) = exist + (id, p) for order/dir/cont/type; `da` uint8 (1,384,640); `bev` f16 (1,7,240,160).
 
@@ -297,14 +327,10 @@ ego-motion (`cv2.warpAffine` on 240×160), decay 0.9; agent footprints rasterise
 (multi-input calibrator). Kept in FP16: LayerNorm/softmax/attention of the ViT, deformable sampling offsets, 3D
 regression, the BEV head. `_pin_fp16` becomes a `precision_map` in the meta.
 
-**Recording protocol** (`recording/protocol.md`, a Phase 0 deliverable): RGB global-shutter camera 1280×720 @30 fps
-(fixed exposure/WB logged) + the depth camera on the same rigid mount + IMU ≥ 100 Hz + GPS ≥ 5 Hz (RTK if available)
-+ OBD speed; one host clock, hardware trigger if possible; storage ROS2/mcap or `frames/<ts>.jpg`, `depth/<ts>.png`
-(uint16 mm + confidence), `imu.csv`, `gps.csv`, `calib.yaml`. Calibration: intrinsics (checkerboard), camera–depth
-extrinsics (factory + checkerboard check), camera–IMU (Kalibr, or gravity-at-rest pitch/roll + measured yaw), camera
-height/pitch measured and refined from the lane vanishing point; a 2-minute static segment per drive for IMU bias.
-Routes: urban / suburban / highway / rural; day / dusk / night; dry / rain. Volume: 20 h initial (~1–2 TB), 2 h
-subsampled at 1 fps (~7k frames) labelled in Supervisely, 500 frames verified for lane order/direction.
+**Recording specification**: `recording/protocol.md` (rig-agnostic): hardware-synchronised stereo pair recorded raw
+(both eyes, exposure timestamps), raw IMU at its output rate stamped at sample time, GNSS stamped with its own fix
+time, optional vehicle speed, OpenCV-format calibration with camera-to-ego and camera-to-IMU, per-drive acceptance
+checks, offline depth labels at full resolution and future-near BEV accumulation.
 
 ## 6. Phases, acceptance tests, GPU budget, risks
 
@@ -333,8 +359,10 @@ bake-off 0.5 → **~13–15 GPU-days** total. First milestone that already beats
 6. Latency overrun → per-module trtexec budget table; knobs in section 3.
 7. Multi-dataset gradient conflict → per-task sample normalisation, replay ratios, calibrated gains, per-source
    metrics every epoch; PCGrad only if a source regresses > 1 point.
-8. Depth-camera range unknown → training clips depth to a random range in [8, 40] m with holes/noise; IPM covers
-   beyond; BEV IoU reported per range band (0–10 / 10–25 / 25–48 m).
+8. Stereo depth range (~24 m at network width) → depth labels offline at full resolution, future-near accumulation for
+   the far BEV, training clips the input depth to a random range in [8, 40] m with holes/noise, IPM covers beyond;
+   BEV IoU reported per range band (0–10 / 10–25 / 25–48 m).
+9. Runtime stereo cost → D1 / D2 / D3 measured on the device (Phase 0) and ablated for accuracy (Phase 3, B2).
 
 ## Verification (end to end)
 
@@ -348,6 +376,6 @@ bake-off 0.5 → **~13–15 GPU-days** total. First milestone that already beats
 
 ## Open points the user decides later
 - Which backbone wins the Phase-0 bake-off (latency vs mAP on the device).
-- Depth camera model (range sets the BEV supervision band) and the recording start date.
-- Whether non-commercial datasets are acceptable for the shipped product (otherwise the product model = BDD + own
-  drives only, with 3D/BEV learned from own drives in Stage 4).
+- Recording start date (the specification is ready) and the rectification alpha (field of view vs valid area).
+- Licences: settled 2026-10-11 — research use, all datasets in one training manifest (the `licence` field stays for
+  provenance).
