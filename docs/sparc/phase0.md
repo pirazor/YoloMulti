@@ -1,7 +1,9 @@
 # SPARC Phase 0: measurement tooling, rig geometry, sample schema
 
-Phase 0 builds what is needed to choose the backbone and the depth path **on the device** before any training
-money is spent. Nothing here is trained: the networks have their deployed shapes and random (BN-calibrated) weights,
+Phase 0 builds what is needed to choose the backbone **on the device** before any training money is spent. It was
+built for the v1 design; the v2 design (`plan.md`, 2026-10-11) keeps all of it: the backbone candidates, the encoder,
+decoder and drivable-area head are unchanged, the depth splat and the stereo head become ablations (B1, D1) rather
+than the default path, and two probes are added before stage C (the BEV warp, the static top-k memory). Nothing here is trained: the networks have their deployed shapes and random (BN-calibrated) weights,
 which is what latency and TensorRT op support depend on.
 
 | deliverable | where |
@@ -38,12 +40,13 @@ Expect 20-60 min in total, dominated by engine builds.
 ### Decision rules (fixed before seeing the numbers)
 
 1. A candidate qualifies when its `full` FP16 engine builds, passes parity (dense relative error < 5 %, drivable-area
-   agreement > 97 %, top-50 box and ID-embedding recall > 80 %), and **full + stereo head <= 28 ms** median GPU time
-   (5 ms of the 33 ms budget are reserved for pre-processing, post-processing and tracking on the CPU / GPU).
+   agreement > 97 %, top-50 box and ID-embedding recall > 80 %), and **full <= 24 ms** median GPU time (the v2 graph adds
+   ~4 ms of temporal memory, traffic-element queries and the depth-free BEV lifting on top of the Phase-0 graph; 5 ms
+   of the 33 ms budget are reserved for pre-processing, post-processing and tracking on the CPU / GPU).
 2. Among qualifying candidates, the Phase-1 short fine-tune on BDD100K (detection mAP + drivable-area mIoU after one
    epoch with pretrained weights) picks the winner; latency breaks ties within 1 mAP.
 3. Op verdicts: `probe_splat_scatter_add` must build and pass; if it fails, the splat moves to a ~40-line TensorRT
    plugin (`bev_pool`), and the IPM-only BEV (`bev_splat=False`) is the fallback engine. If `probe_msda_grid_sample` fails
    or is slow, `attn_mode="gather"` (probe `probe_msda_gather`) replaces it.
-4. Depth path: D1 (in-network stereo head) if `probe_stereo_head` + the chosen full graph fit rule 1; otherwise D2/D3
-   (`docs/sparc/plan.md` section 0).
+4. Stereo head: `probe_stereo_head` gives its cost; it enters the design only through ablation D1 (`plan.md` section 5),
+   since v2 does not depend on a depth input.

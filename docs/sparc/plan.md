@@ -1,381 +1,255 @@
-<!-- Status: design approved 2026-10-11; Phase 0 implemented (see docs/sparc/phase0.md), on-device bake-off pending. Supersedes the YOLO26-based plan. Section 0 records what Phase 0 changed. -->
+<!-- Status: v2 design, 2026-10-11. Replaces plan_v1_superseded.md after review: depth must not be load-bearing, training
+starts on public datasets before any own recordings, and the novelty claims are stated honestly. Phase 0 (docs/sparc/phase0.md)
+remains valid: the bake-off tooling, rig geometry and schema are reused; the stereo head becomes an optional ablation. -->
 
-# SPARC: one sparse-query perception network for the Jetson Orin Nano Super
+# SPARC v2: one temporal sparse-query perception network, trained first on public data
 
-## Context
+## 0. What the review changed
 
-The merged `adas_mt` model is a YOLO26 CNN with two segmentation heads. The user rejected it: it is an
-adaptation of an existing detector, it cannot grow into the required system, and YOLO26 is no longer the
-accuracy/latency frontier. The required system (decided in Q&A on 2026-10-11) is a **single network** for a
-front stereo camera (depth from stereo) + IMU + GPS on an **Orin Nano Super at ≤ 33 ms (FP16 TensorRT, 384×640)** that outputs:
+1. **Depth is an auxiliary signal, not a dependency.** v1 built the BEV map by splatting features with measured depth.
+   v2 lifts to BEV without depth (query-based lifting) and uses depth only as (a) a training target for an auxiliary
+   depth head and (b) an optional input the network is trained to work without (depth dropout). The stereo head of
+   Phase 0 is kept as an ablation, not as the basis of anything.
+2. **Public datasets first.** Every output of the network has a public source of supervision (section 3); the
+   complete model is trained and benchmarked before a single own frame is recorded. Own recordings are a fine-tuning
+   stage, and the recording specification (`recording/protocol.md`) is unchanged.
+3. **Temporal processing is the main accuracy lever.** The decoder propagates its queries from the previous frame,
+   moved by ego-motion. In the literature this is the single largest gain available for camera 3D detection, tracking
+   and online mapping, and it costs almost nothing at inference (section 1). v1 had no temporal model.
+4. **Honest novelty.** Section 7 lists what is taken from published work and what is new. No performance jump is
+   promised; section 5 defines the measurements that decide every claim.
 
-1. road users: detection + tracking + **vehicle 3D state** (position/depth, yaw, size);
-2. traffic-light colour and **fine traffic-sign class** (Mapillary TSD, ~400 classes) in the same pass;
-3. drivable area (direct/alternative) and **lane instances with attributes**: order relative to ego,
-   travel direction (same/opposing), continuity, colour/type;
-4. a **learned BEV map head**: drivable area, lane lines with heading, agent footprints on an ego-centred grid.
+## 1. Where the gains come from (evidence, and what SPARC does with it)
 
-Datasets: BDD100K, CULane, Mapillary Traffic Sign Dataset (MTSD), nuScenes front camera (3D boxes, LiDAR depth,
-HD-map BEV labels), and the user's own drives (no recordings yet; a recording protocol is a deliverable).
-Training: one A100/H100-class GPU for days. Target branch `multitask`; the old plan below this line is superseded.
+| lever | measured effect in the literature | in SPARC v2 | inference cost |
+|---|---|---|---|
+| Foundation features (DINOv3 / DINOv2 trunks) | DEIMv2-S: 50.9 AP with 9.7 M params / 25.6 GFLOPs (ViT-Tiny distilled from DINOv3); RF-DETR-S 53.0 AP @ 3.5 ms T4; YOLO26s 48.6 AP. +2–4 AP at equal latency for small models. | backbone bake-off (Phase 0 tooling): DINOv3 ViT-T/S, DINOv2 ViT-S, DINOv3 ConvNeXt-T, YOLO26s reference | the backbone itself |
+| Temporal query propagation | StreamPETR: +11.4 mAP / +13.1 NDS over its single-frame baseline (Focal-PETR, R101) "with negligible computation cost"; Sparse4Dv3: tracking by propagated instances, +7.6 AMOTA; StreamMapNet: streaming map queries beat single-frame mapping at 14 FPS | all typed queries (agents, lanes, map, traffic elements) are propagated frame to frame, moved by measured ego-motion; identities come from propagation | top-k query memory + one ego-motion transform; no extra backbone pass |
+| Training recipe for DETR-style heads | DEIM (dense one-to-one matching + matchability-aware loss): beats RT-DETRv2 / D-FINE at half the epochs; D-FINE's distribution refinement; RT-DETRv4's frozen-DINOv3 feature injection (+1–2 AP, training only) | DEIM matching and MAL for agents and traffic elements; D-FINE-style box distribution; DINOv3 teacher on the encoder; same-architecture distillation SPARC-L → SPARC-S at the end | none |
+| Depth as supervision, not as input | BEVDepth: explicit depth supervision from LiDAR improves camera-only BEV accuracy and robustness; modality dropout is the standard way to keep a model working when a sensor is missing (UniBEV) | auxiliary depth head trained on LiDAR (nuScenes, Argoverse 2, Waymo, DrivingStereo) and on foundation-model pseudo-depth elsewhere; depth input with dropout | ~0.5 GFLOPs |
+| Geometry-aware multi-dataset training | Omni3D / Cube R-CNN: a *virtual camera* (one focal length for all datasets) is what makes mono-3D training across datasets with different intrinsics work, and it enables scale augmentation | every image is warped to a canonical pinhole camera before the network; K and cam2ego are inputs; 3D targets are expressed in virtual depth | none |
+| Resolution over lifting cleverness | Simple-BEV: input resolution and batch size move BEV accuracy far more than the lifting method; a parameter-free bilinear lifter is competitive | spend the Orin budget on resolution (384×640 → 448×768 is an ablation) rather than on a heavier BEV module; BEV lifting = cheap deformable sampling at a few heights | resolution-linear |
+| One trunk for every task | the current rig runs five separate engines (detector, lane net, sign classifier, stereo net, face/gaze) | one engine; the multi-task baselines on BDD100K (YOLOP 76.4 mAP50 / 89.0 DA mIoU / 44.0 lane IoU; A-YOLOM-s 81.1 / 91.0 / 49.7; RMT-PPAD 84.9 / 92.6 / 56.8, all measured under one protocol in arXiv 2511.05557) are the bar | shared |
+| Attention cost | LW-DETR / RF-DETR replace most global self-attention blocks by windowed ones | windowed attention in 3 of every 4 ViT blocks (bake-off variant) | −4–5 GFLOPs on ViT-S |
+| INT8 / sparsity on Orin | mixed: RF-DETR-Base 14.8 ms FP16 → 11.8 ms INT8 on Orin Nano Super; but a DEIMv2 INT8 build on Orin NX (JetPack 6.2) ran *slower* than FP16 in one report, and 2:4 sparsity gave no speed-up on Orin in another | FP16 first; INT8 only for the convolutional parts, kept only if measured faster at equal accuracy; no reliance on sparsity | measured, not assumed |
 
-## 0. Phase-0 update: the sensor is a stereo pair, so depth costs compute
+Levers investigated and **not** adopted: separate stereo network (55 ms on Orin NX, more than the budget); learned
+per-pixel depth distributions for lifting (LSS) as the only path to BEV (fails when depth fails); token pruning
+(dynamic shapes, TensorRT-unfriendly, small gains on dense tasks); DLA offload (the Orin Nano has no DLA);
+uncertainty-based loss weighting as the default (drifts with partial labels; kept as ablation B3).
 
-The "depth camera" is a stereo pair (the example rig: global-shutter eyes, 1440x900 crops, 99.8 mm baseline). Four
-consequences, measured with `python -m sparc rig` on the example calibration (`docs/sparc/phase0.md`):
-
-1. **Depth is not a free input.** A separate foundation stereo engine costs ~55 ms per frame on an Orin NX at
-   320x320, more than the whole budget. Runtime depth options, decided by the Phase-0 device run and the Phase-3
-   accuracy ablation: **D1** the in-network stereo head (`sparc/nn/stereo.py`: the right eye costs a 4-conv stem, a
-   48-level group-wise correlation volume and convex upsampling, ~5.6 GFLOPs), **D2** an external stereo engine on a
-   second stream, **D3** no runtime stereo (IPM + learned depth cues only). The engine contract supports both a
-   `depth` input (D2, or LiDAR during training) and `image_right` + `baseline` inputs (D1).
-2. **Depth precision is range-limited**: error < 10 % (0.25 px disparity error) to ~53 m at full eye width, ~24 m at
-   the 640-px network width, ~12 m at 320 px. Training depth labels therefore come from a large stereo model run
-   **offline at full resolution** on recorded raw pairs (a second, legitimate teacher use case), and the BEV beyond
-   ~25 m is supervised by **future-near accumulation**: a region 40 m ahead is labelled from the later frames in
-   which it is 5-10 m ahead, moved back with the recorded ego-motion (`recording/protocol.md` section 7).
-3. **The perception input is the rectified left eye**: depth lives in the rectified frame; on the example rig the
-   rectified and raw left images differ by a 1.5x focal length, so mixing them misplaces every depth sample.
-   Rectification with `alpha = 0` cuts the horizontal FOV from 78 to 57 deg; `alpha ~0.5` keeps ~83 deg. Raw
-   pairs are recorded, so the choice stays open.
-4. **Splat geometry**: taking the nearest depth of a stride-8 block biased ground points towards the camera by
-   ~1 m at 10 m; the splat now uses stride-4 points with the mean valid depth of each 4x4 block (unit-tested: no
-   range bias on a flat ground).
-
-Measured shared-part cost at 384x640 after slimming to real-time-DETR widths: encoder 8.0, decoder 4.4, drivable
-area 1.2, BEV 6.1, stereo head 5.6 GFLOPs; backbones 7.5 (YOLO26s reference) to 44 GFLOPs (ViT-S, ConvNeXt-T).
-The rig code is generic (any OpenCV stereo calibration); the recording specification is written for any recorder.
-
-## What the research says (Oct 2026, sources in the chat log)
-
-- **Real-time detection moved from YOLO to DETR-style decoders.** On COCO at T4-FP16 latency: RF-DETR-N 48.4 AP @ 2.3 ms
-  (384²), RF-DETR-S 53.0 @ 3.5 ms, RF-DETR-M 54.7 @ 4.4 ms (ICLR 2026, DINOv2 backbone, Apache-2.0 up to L);
-  DEIMv2-S 50.9 AP with 9.7 M params / 26 GFLOPs (DINOv3-distilled ViT-Tiny); RT-DETRv4-S 49.7 AP (DINOv3 teacher via a
-  Deep Semantic Injector, training-time only). YOLO26s: 48.6 AP @ 2.5 ms. At the small end the DETR family is **+2–4.5 AP
-  at equal latency**, and its decoder is what makes one network for many output types possible.
-- **Foundation features are the accuracy lever, at zero inference cost.** DEIMv2 and RT-DETRv4 both get their gains from
-  DINOv3 (as backbone initialisation or as a frozen teacher). DINOv3 also ships ConvNeXt-T/S/B/L backbones distilled from
-  its 7 B ViT (TensorRT-clean CNNs). This is the concrete "teacher use case": +AP for free on the device.
-- **Orin Nano Super feasibility.** RF-DETR-Base measures 14.8 ms FP16 / 11.8 ms INT8 (TensorRT) on this device; RF-DETR-Seg
-  ~15 ms; DEIMv2-Atto 89 FPS. A ViT-S-class backbone fits the budget; the earlier "ViT is unsafe on Jetson" worry was
-  overcautious. All numbers must still be re-measured on the user's device (Phase 0).
-- **Per-query structured outputs work in these decoders**: RF-DETR Keypoint (June 2026) predicts keypoints + uncertainty
-  per detected object inside the detection transformer; MOTIP (CVPR 2025) learns tracking as ID prediction end to end;
-  MonoDETR/MonoDINO-DETR predict 3D state per query from one camera; Sparse LaneFormer / O2SFormer predict lanes as
-  queries; SparseDrive / Sparse4D show sparse queries beat dense BEV for latency. Nobody combines these for a single
-  front camera on an edge device with depth-grounded BEV supervision: that is the gap this design fills.
-- **Labels that do not exist publicly** and must be derived or self-generated: lane travel direction / ego ordering
-  (BDD100K only has parallel/perpendicular, continuity, type/colour; CULane has geometry only), 3D boxes on BDD100K
-  (use nuScenes front camera; licence CC BY-NC-SA), BEV maps (nuScenes HD-map layers for pretraining; own drives for
-  the user's rig).
-
-## The design: SPARC (Sparse Perception with Attributed queries and Range-grounded BEV Context)
+## 2. Architecture
 
 ```
-RGB 384×640 ──► foundation backbone (DINOv2/3, Phase-0 bake-off) ──► hybrid encoder ──► P3 P4 P5 (+P2)
-                                                                                         │
-            ┌────────────────────────────────────────────────────────────────────────────┤
-            │  UNIFIED SPARSE DECODER (3–4 deformable-attention layers, d=256)           │
-            │  typed queries share the cross-attention over the image features:         │
-            │   • agent queries (≈200): 2D box, class(10), 3D state (depth, yaw, dims),   │
-            │       ID embedding (tracking), attributes: light colour, sign class (MTSD)  │
-            │   • lane queries (≈24): row-anchored polyline, existence, order vs ego,     │
-            │       travel direction, continuity, colour/type                             │
-            └──────────────┬───────────────────────────────┬─────────────────────────────┘
-                           │                               │
-  dense heads: drivable area (stride 8), lane aux mask     │  3D states ──► rendered agent footprints
-                           │                               ▼
-  stereo depth (in-network head or input) + K + cam2ego ──► DEPTH SPLAT (image features → BEV cells;
-                                 learned ground-plane branch where depth is missing) ──► BEV decoder
-                                 ──► BEV drivable area, BEV lane lines + heading, agent footprints
+                 previous frame: top-k typed queries + their 3D / BEV states ──► moved by ego-motion (IMU+GNSS, or dataset pose)
+                                                                                     │
+RGB (virtual camera 384×640) ──► backbone ──► hybrid encoder ──► P3 P4 P5 ──────────┼──────────────────────────────────┐
+     K, cam2ego (inputs)                         │                                   ▼                                  │
+                                                 │        TEMPORAL TYPED-QUERY DECODER (3 layers, d = 256)              │
+                                                 │   agent queries      : 2D box, class, 3D state, attributes, ID     │
+                                                 │   traffic-element q. : light colour / sign meaning + fine class     │
+                                                 │   lane queries       : 3D polyline in the ego frame, order, dir,    │
+                                                 │                        continuity, type (2D view by projection)     │
+                                                 │   map queries (BEV)  : coarse 60×40 grid, lifted from the image by  │
+                                                 │                        deformable sampling at 4 heights (no depth)  │
+                                                 │   topology head      : which light/sign governs which lane          │
+                                                 ▼                                                                      │
+                               aux depth head (stride 8, 64 bins) ──► depth-aware features for 3D and BEV ◄── optional depth input (dropout-trained)
+                               drivable-area image head (stride 4)
+                               BEV decoder: map queries → 240×160 drivable / lane line / heading / agent occupancy
 ```
 
-Key decisions:
-- **Backbone** chosen by measurement on the Orin (Phase 0): (a) RF-DETR-S DINOv2-S windowed ViT + its encoder
-  (COCO-pretrained, Apache-2.0), (b) DINOv3 ConvNeXt-T distilled, (c) DEIMv2-style distilled ViT-Tiny. Default
-  expectation: (a) for accuracy, (b) as the TensorRT-safe fallback.
-- **One decoder, typed queries**: the same deformable cross-attention serves agents and lanes; only the query sets,
-  heads and matching differ. Tracking v1 = ID embeddings + 3D positions matched in post-processing (MOTIP-style ID
-  loss on BDD100K MOT clips); v2 = one-frame track-query memory.
-- **Depth-grounded splat BEV**: no learned per-pixel depth distribution (LSS) — metric stereo depth (section 0) places
-  features with a per-frame BEV index (ScatterElements-add, TensorRT-safe if the Phase-0 probe passes); a learned
-  IPM branch covers cells without depth. On monocular sources (nuScenes) LiDAR depth is fed through the `depth`
-  input during training.
-- **Supervision without manual BEV/3D labels on the user's rig**: nuScenes pretrains the 3D and BEV heads; the
-  user's drives provide depth-derived positions, tracking-derived headings and **self-generated BEV labels**
-  (perspective labels lifted by measured depth, accumulated over time with GPS/IMU ego-motion, rasterised).
-- **Multi-dataset training with partial-label masking** (each loss only where the source labels it), staged
-  curriculum, DINOv3 teacher distillation on the encoder features (training-time only).
-- **Derived lane labels**: travel direction from marking colour/type rules (yellow = opposing-traffic boundary in
-  BDD/US) + ordering from lane position vs the ego centre + ego trajectory on own drives; a small manually verified
-  subset to measure the derived labels' precision before training on them.
+**Inputs.** `image` (rectified, warped to the canonical virtual camera: fixed focal length, principal point at the
+centre), `K` and `cam2ego` of the virtual camera, `ego_motion` (4×4 from the previous frame), `memory` (previous
+top-k queries and states; zeros on the first frame), and an optional `depth` map. One engine serves any rig, because
+the warp to the virtual camera happens in pre-processing from the rig's own calibration.
 
-## Evaluation: what "superior" will mean, measured
+**Backbone and encoder.** As Phase 0: P2 for detail, hybrid encoder at 256 channels for P3–P5. The DINOv3 teacher
+regularises the encoder during training (RT-DETRv4 style); it does not exist at inference.
 
-| output | benchmark | baseline to beat |
+**Auxiliary depth head.** A 1×1 conv on the stride-8 encoder map predicts a 64-bin depth distribution per cell
+(BEVDepth-style), supervised by LiDAR where it exists, by DrivingStereo disparity, and by pseudo-depth from a metric
+monocular foundation model (UniDepth / Metric3D class) on datasets without range sensors. Its expected depth and
+confidence become a *feature* (a depth positional encoding) for the 3D heads and the BEV lifting. If a `depth` input
+is present, it is fused into the same head with 50 % dropout during training, so the network is calibrated to use it
+when it is good and ignore it when it is absent or wrong. Nothing downstream requires it.
+
+**Decoder: typed, temporal.** Four query types share the decoder layers (self-attention over all queries with a type
+embedding, deformable cross-attention over P3–P5, FFN):
+- *agents* (200): selected from encoder tokens (RT-DETR query selection) **or propagated from frame t−1**; heads: 2D box
+  (D-FINE distribution), class over the unified vocabulary, 3D state (virtual depth, yaw, size), ID embedding;
+- *traffic elements* (50): lights and signs; heads: 2D box, colour / meaning (OpenLane-V2's 13 attributes), fine sign
+  class (unified sign vocabulary, section 3), association to a lane via the topology head;
+- *lanes* (24): a 3D polyline in the ego frame (x forward, y lateral, z height, 20 points to 60 m), existence, order
+  relative to ego, travel direction, continuity, type. The image-space polyline is the *projection* of the 3D one
+  through K / cam2ego, so 2D-only datasets (CULane, BDD100K) supervise the 3D lane through the projection with a
+  ground-plane prior, and 3D datasets (OpenLane, maps) supervise it directly. Lanes are parallel, 3–4 m apart and
+  continuous in time: priors a 2D row-anchor head cannot use;
+- *map* (60×40 BEV cells of 0.8 m): each cell samples image features at 4 heights through deformable attention
+  (BEVFormer-style spatial cross-attention, depth-free) weighted by the auxiliary depth distribution, then a small
+  CNN decodes 240×160 drivable area, lane lines with heading, agent occupancy.
+
+*Temporal propagation.* After frame t, the top-k agents (by score), all lanes with existence > 0.3, the traffic elements
+and the map feature grid are stored. At t+1 their 3D states are moved by the measured ego-motion (agents: position;
+lanes: polyline; map: warped grid), re-encoded as query content + position, and concatenated with the fresh queries.
+A propagated agent keeps its identity, so tracking is the propagation itself (Sparse4Dv3 / MOTR style); the ID
+embedding remains as the fallback for re-identification after occlusion. Training uses clip pairs and triplets
+with the dataset's ego poses; at deployment the ego-motion comes from the IMU + GNSS (or visual odometry).
+
+**Dense drivable-area head.** Kept (BDD100K labels it in the image; it is cheap). Ablation B5 replaces it by rendering
+the BEV drivable area into the image.
+
+**Not in the deployed graph.** The DINOv3 teacher, the lane-mask auxiliary head, denoising queries, and the stereo head
+(ablation D1 only).
+
+### Budget (CPU-measured FLOPs from Phase 0 where the module exists; estimates marked ~)
+
+| module | GFLOPs @384×640 | note |
 |---|---|---|
-| detection | BDD100K det mAP | RF-DETR-S and YOLO26s fine-tuned on BDD100K |
-| tracking | BDD100K MOT mMOTA / mIDF1 | ByteTrack (val 45.5 / 54.8) |
-| lanes | CULane F1@50 | CLRNet 80.5 (LaneLM 82.7 as the ceiling reference) |
-| drivable area | BDD100K DA mIoU | current adas_mt model |
-| 3D | nuScenes front-cam mono-3D AP | MonoDETR-class baseline |
-| BEV map | BEV IoU (drivable, lane divider) on nuScenes front cam | LSS single camera |
-| signs / lights | MTSD top-1; BDD light colour accuracy | current sign_classifier |
-| latency | Orin Nano Super FP16/INT8 per output | ≤ 33 ms total |
+| backbone | 7.5 (YOLO26s) … 12.8 (ViT-T) … 44 (ViT-S / ConvNeXt-T) | windowed attention ~−4 on ViT-S |
+| encoder | 8.0 | measured |
+| decoder (4 query types, 3 layers) | ~5.5 | 4.4 measured for 224 queries; +50 traffic elements |
+| aux depth head | ~0.5 | 1×1 conv + softmax |
+| drivable-area head | 1.2 | measured |
+| BEV lifting (2400 cells × 4 heights) + decoder | ~3 | replaces the 6.1 of the v1 splat path |
+| temporal memory | ~0.2 | MLPs on ≤ 300 queries + one 240×160 warp |
+| **total** | **26 (YOLO26s) … 31 (ViT-T) … 62 (ViT-S)** | the Orin numbers decide; ≤ 28 ms FP16 is the bar |
 
-## Honest framing of the novelty
+## 3. Public datasets: what trains what
 
-Each component is grounded in 2025–26 state of the art (DETR-style real-time decoders, per-query structured outputs,
-ID-prediction tracking, mono-3D queries, lane queries, sparse-first perception, DINOv3 distillation). What does not
-exist as a published system is their combination for **one front camera + depth + IMU/GPS on an edge device**, with
-a **sensor-grounded BEV** (measured depth instead of a learned depth distribution) that is **supervised without manual
-BEV/3D labels on the user's rig**. "Superior" is demonstrated only by the benchmark table above, run by this plan's
-ablation protocol; nothing is promised before it is measured. Budgets (latency, GPU-days) are estimates until Phase 0.
-
-## 1. Repository layout
-
-New package `sparc/` next to `adas_mt/` (add `sparc*` to `pyproject.toml` `packages.find`). `adas_mt/` stays as the
-YOLO26s baseline (A0) and as a library: every core module there subclasses Ultralytics (`DetectionModel`,
-`DetectionTrainer`, `YOLODataset`) and `docs/training_requirements.md` lists 55 workarounds for that coupling; a
-multi-input DETR-style graph with Hungarian matching, clip sampling and multi-dataset mixing does not fit it.
-
-| reused verbatim | reused with small backward-compatible edits | replaced (new in `sparc/`) |
+| output | datasets (front camera unless noted) | labels used |
 |---|---|---|
-| `adas_mt/deploy/preprocess.py` (letterbox, `LetterboxInfo`, `letterbox_torch`) | `adas_mt/deploy/runner.py`: `TrtBackend`/`OrtBackend` take `input_names` + per-input buffers (today one `(B,3,H,W)` input); `iter_frames`, `bench`, `predict` loop unchanged | `nn/model.py`, `nn/heads.py`, `nn/loss.py` → `sparc/nn/*` |
-| `adas_mt/deploy/meta.py` | `adas_mt/deploy/trt_build.py`: multi-input profiles/calibrator; precision map from meta | `engine/{train,val,config}.py` → `sparc/engine/*` (config dataclass pattern kept) |
-| `adas_mt/engine/metrics.py` (`SegConfusion` for DA, lane-aux, BEV layers) | `adas_mt/export.py`: `TRT_OPS`, `audit_ops`, `_embed_meta`, `_pin_io_shapes`, parity pattern → `sparc/deploy/export.py` adds `GridSample`, `ScatterElements` | `data/dataset.py`, `data/transforms.py` → `sparc/data/*` |
-| `adas_mt/data/masks.py` (DA + lane-aux packed in one uint8) | `tests/test_adas_mt/fake_trt.py`: multi-input context | `deploy/evaluate.py` → `sparc/engine/evaluators/` |
-| `adas_mt/distill/teacher.py`, `distill/loss.py` (`FrozenTeacher`, `distill_terms`, `KDProjector`) | `adas_mt/distill/pretrain.py` is the template for the lean trainer loop | `convert_supervisely.py` stays (own labels); `sign_classifier/` stays as the sign baseline |
-| `colab/train_adas_mt.ipynb` cell pattern → `colab/train_sparc.ipynb` | | |
+| road users 2D | BDD100K det (100k, 10 classes), nuImages, ZOD Frames (100k, 2D to 245 m), Waymo 2D, Argoverse 2 | boxes; class vocabulary per source (Null-BCE masking) |
+| road users 3D state | nuScenes (CAM_FRONT), Argoverse 2 sensor (ring_front_center, 20 fps, LiDAR), Waymo camera-only 3D (front), ZOD (3D boxes), KITTI | 3D boxes → virtual depth, yaw, size |
+| tracking | BDD100K MOT (box_track), nuScenes, Argoverse 2, Waymo, KITTI tracking | track ids across frames + ego poses |
+| traffic-light colour | BDD100K (`trafficLightColor`), OpenLane-V2 traffic elements (red / green / yellow + arrow meanings, with topology), DTLD (230k annotations, red-yellow state), Bosch (13k frames), LISA | colour / meaning per box |
+| traffic-sign fine class | MTSD (206k signs, 313 classes), ZOD (446k signs, 156 classes), TT100K (221 classes), GTSRB crops | unified sign vocabulary (section 3.1) |
+| lanes 2D + attributes | BDD100K lanes (style, type, parallel / perpendicular), CULane (4 lanes with fixed ego order), CurveLanes (up to 9 lanes), ZOD lane-marking instances (colour, cardinality) | polylines, order, continuity, type |
+| lanes 3D + order | OpenLane (200k frames, 880k lanes, 14 categories, ego-relative position of up to 4 lanes), ONCE-3DLanes, Apollo synthetic | 3D polylines |
+| travel direction | nuScenes map (directed lanes), Argoverse 2 map (lane segments with direction, neighbours, marking types), OpenLane-V2 centerlines (directed) → projected into the front camera with the ego pose | per-lane direction, derived without rules |
+| drivable area (image) | BDD100K (direct / alternative), ZOD ego-road, Mapillary Vistas (road) | masks |
+| BEV map | nuScenes and Argoverse 2 HD maps rasterised in the ego frame (drivable area, lane dividers with heading, ordering from lane neighbours) | 240×160 rasters |
+| topology (element ↔ lane) | OpenLane-V2 (on Argoverse 2 and nuScenes) | lane–traffic-element pairs |
+| depth (auxiliary) | nuScenes / Argoverse 2 / Waymo / ZOD LiDAR, DrivingStereo (180k stereo pairs with LiDAR disparity), KITTI; pseudo-depth from a metric mono model on BDD100K / CULane | per-pixel metric depth |
 
-```
-sparc/
-  cli.py __main__.py            convert | bakeoff | train | val | export | trt-build | predict | bench | eval
-  cfg/   model_{n,s}.yaml  stage{1,2,3,4}.yaml
-  data/  schema.py  converters/{bdd100k,culane,mtsd,nuscenes_front,own_drive}.py  lane_rules.py
-         dataset.py  augment.py  targets.py  synthetic.py
-  nn/    backbone.py encoder.py deform_attn.py decoder.py heads.py bev.py model.py matcher.py loss.py
-  distill/hook.py   engine/{config,trainer,ema,balance}.py   engine/evaluators/{det_coco,mot,culane,seg,nusc3d,bev,sign}.py
-  track/{associate,bev_accum}.py   deploy/{export,runner,postprocess}.py   utils/{profile,geometry}.py
-tests/test_sparc/   docs/sparc/   recording/{protocol.md,record.py,calibrate.md}
-```
+All of these are research licences or more permissive (ZOD is CC BY-SA); the `licence` field in the schema records
+provenance. Every converter writes the Phase-0 `Sample` schema; `LabelMask` says which losses apply to a frame.
 
-## 2. Data layer
+### 3.1 Harmonisation decisions
+- **Virtual camera.** Images are warped to a 60° horizontal-FOV pinhole at 640 px width (fx ≈ 554). Datasets without
+  calibration (BDD100K, CULane) get a nominal K estimated once per dataset from lane vanishing geometry; their 3D
+  losses are masked anyway, so an error there only affects the lane ground-plane prior.
+- **Class vocabularies.** Road users: BDD100K's 10 classes as the base; other sources map onto it with per-source
+  `cls_vocab` masks (nuScenes has no "traffic sign" boxes, Waymo has no "rider", etc.). Signs: a unified taxonomy built
+  from MTSD's hierarchy; ZOD and TT100K classes map onto it where a one-to-one mapping exists and are masked
+  otherwise; region-specific classes stay region-specific (the fine-tuning stage adds the deployment region's signs).
+- **Lane semantics.** OpenLane's categories, BDD's `laneType`, ZOD's colour / cardinality all map onto {single /
+  double} × {white / yellow} + curb; CULane and CurveLanes supervise geometry and order only.
+- **Lane order and direction.** From CULane (fixed order), OpenLane (ego-relative position), and maps (nuScenes,
+  Argoverse 2: direction and neighbours); v1's hand-written colour rules become a fallback for BDD only, flagged
+  `weak`.
+- **Per-source evaluation.** Every stage reports metrics per dataset; a source that regresses by > 1 point when
+  another is added is a label conflict to resolve, not noise.
 
-**Unified sample** (`sparc/data/schema.py`; one `.npz` + JSON per frame, written by every converter):
-```python
-@dataclass
-class Sample:
-    image: str; depth: str | None          # depth: uint16 PNG in mm, 0 = invalid
-    K: np.ndarray                          # 3x3 at native resolution
-    cam2ego: np.ndarray                    # 4x4, pitch/roll-corrected (identity + camera height for 2D-only sets)
-    boxes2d, cls, tl_color, sign_cls       # (N,4) xyxy, (N,), (N,) -1 = unlabelled
-    box3d: np.ndarray                      # (N,7) depth, yaw, l, w, h, x, y   | track_id (N,), clip_id, frame_idx
-    lanes: list[LaneInstance]              # polyline (M,2) px, order, direction, continuity, ltype, weak: bool
-    da_mask, lane_mask: str | None         # uint8 PNG class maps
-    bev: str | None                        # uint8 (3,240,160): drivable class, lane line, heading bin (+ agent occupancy)
-    label_mask: LabelMask                  # bools: det, cls_vocab(10,), tl, sign, box3d, depth, da, lane_geom,
-                                           # lane_{order,dir,cont,type}, bev_{da,lane,agent}, track
-    licence: str                           # "bsd" | "research" | "own"
-```
-`cls_vocab` is the Null-BCE mask: BDD = all 10 classes; MTSD = {traffic sign}; nuScenes = {car, truck, bus,
-motorcycle, bicycle, pedestrian}; CULane = none.
+## 4. Training plan (one A100/H100, public data only until stage E)
 
-**Converters** (`python -m sparc convert <source> --src --dst`):
-- `bdd100k.py`: det JSON (10 classes, `trafficLightColor`), MOT (`box_track`, keeps `clip_id`), drivable polygons →
-  `da_mask` (1 direct / 2 alternative), lane polylines with `laneStyle/laneType/laneDirection` → `LaneInstance` +
-  rasterised `lane_mask` (8 px at 720p, as the existing converter).
-- `culane.py`: the 4 row-anchored lanes have fixed semantics → **order labels for free** (ego-left-2, ego-left,
-  ego-right, ego-right-2); existence list.
-- `mtsd.py`: boxes + ~400 classes; `cls_vocab = {sign}`; also writes crops for `sign_classifier/` (baseline).
-- `nuscenes_front.py`: CAM_FRONT keyframes; 3D boxes → camera frame (depth, yaw, dims, ego xy); LiDAR → projected
-  sparse depth + IP-Basic completion → `depth`; `cam2ego` from calibration + ego pose; map layers (`drivable_area`,
-  `lane_divider`, `road_divider`) rasterised in the ego frame (x forward 0–48 m, y −16..16 m, 0.2 m → 240×160);
-  divider heading from the polyline tangent (8 bins + sin/cos); agent footprints from the boxes.
-- `own_drive.py`: reads the recording format (section 5), interpolates IMU/GPS to frame timestamps, writes `K`,
-  `cam2ego`, `depth`; labels merge from `convert_supervisely.py` output by stem and from the pseudo-label tools.
-
-**Derived lane labels** (`lane_rules.py`, all `weak=True`, loss weight 0.3): reference row y = 0.9 H; ego lane = the
-two markings bracketing x = W/2; order = signed index from the ego lane (clipped to ±3); direction: markings on the
-far side of a single/double **yellow** line = `opposing` (US rule, BDD), curb = `boundary`, else `same`; continuity
-from `laneStyle`, type from `laneType`. Own drives: the GPS/IMU ego trajectory picks the ego lane; tracked agents
-with yaw ≈ 180° on a lane mark it `opposing`. A **500-frame manually verified set** (`weak=False`) is the only set
-on which direction/order accuracy is reported.
-
-**Mixing** (`dataset.py`): `MixedDataset(sources, weights)` with a DDP-aware `WeightedSourceSampler`;
-`ClipPairDataset` yields (t, t+k), k ∈ 1..3, for tracking. Collate pads variable-N targets into lists; dense targets
-and `label_mask` are stacked.
-
-**Augmentation** (`augment.py`; every op updates `K`, boxes, polylines, masks, BEV consistently): scale 0.6–1.4 +
-translate (`K` scaled/shifted, depth resampled nearest, BEV untouched: the ego frame does not change); horizontal
-flip p = 0.5 (3D x → −x, yaw → −yaw, BEV mirrored in y, lane order sign flipped, heading mirrored); photometric HSV
-with hue ≤ 0.015 (traffic-light colours); depth noise/holes/range clipping. **No rotation** (breaks row anchors and
-the corrected extrinsics) and **no mosaic for 3D/BEV samples** (a mosaic tile has its own principal point and ego
-pose; one `K`/`cam2ego`/BEV grid cannot describe the composite). v1 trains without mosaic (DETR-style detectors do);
-a 2D-only mosaic for BDD-det/MTSD is a Phase 6 ablation.
-
-## 3. Model layer (`sparc/nn/`, shapes at 384×640, batch 1; all estimates until Phase 0)
-
-| module | in → out | params | GFLOPs | Orin FP16 ms |
+| stage | data (sampler weights) | what is trained | GPU-days | acceptance (must hold to continue) |
 |---|---|---|---|---|
-| `backbone.py` `BackboneFactory("rfdetr_s" \| "dinov3_convnext_t" \| "deimv2_vit_t")` | image → P2 (64,96,160), P3 (·,48,80), P4 (·,24,40), P5 (·,12,20) | 6–28 M | 12–25 | 7–13 |
-| `encoder.py` HybridEncoder: AIFI on P5 (240 tokens) + CCFM PAN → 256 ch | P3/P4/P5 at 256 ch | ~4 M | ~4 | ~3 |
-| `decoder.py` TypedQueryDecoder, 3 layers, d = 256, 8 heads × 3 levels × 4 points | 224 queries over 5040 tokens | ~6 M | ~0.5 | ~3 |
-| `heads.py` AgentHead | box2d(4), cls(10), box3d(depth, sin, cos, l, w, h), tl(4), sign(401), id_emb(64) | 0.5 M | <0.1 | <1 |
-| `heads.py` LaneHead | x per row (72), visibility (72), exist(1), order(7), dir(3), cont(2), type(6) | 0.2 M | <0.1 | |
-| `heads.py` DAHead (stride 8, as `adas_mt`) + LaneMaskHead (stride 4, training-only aux) | (3,384,640), argmax in graph | 0.2 M | ~0.8 | ~1 |
-| `bev.py` DepthSplat + IPMSampler + BEVDecoder + BEVHead | (7,240,160) | ~2 M | ~2.5 | 3–4 |
-| **total** | | 19–41 M | 24–33 | **18–26 GPU + 3–5 CPU** |
+| **A: 2D** (weeks 1–3) | BDD det/DA/lanes 0.35, ZOD 0.2, OpenLane-2D 0.15, CULane 0.1, MTSD + TT100K 0.1, DTLD/Bosch/LISA 0.05, nuImages 0.05 | backbone (bake-off winner), encoder, agents 2D, traffic elements (colour + fine class), lanes (projected 2D + attributes), drivable area; DEIM matching, DINOv3 teacher | 3 per run, 3 runs (bake-off top-2 + recipe ablation) | BDD det mAP ≥ DEIMv2-S fine-tuned on BDD − 0.5 while also producing DA + lanes; DA mIoU ≥ 92; CULane F1 ≥ 79; MTSD top-1 ≥ current `sign_classifier` |
+| **B: 3D, depth-aux, BEV** (weeks 4–6) | + nuScenes front 0.15, Argoverse 2 front 0.15, Waymo front 0.1, OpenLane-3D 0.1, DrivingStereo 0.05 (stage-A replay 0.45) | 3D state, aux depth (LiDAR + pseudo-depth, depth dropout), 3D lanes, map queries + BEV decoder, topology head | 3 | OpenLane F1 ≥ 58 (BEV-LaneDet level); nuScenes front-cam 3D AP within 2 of a MonoDETR-class model re-evaluated on the same subset; BEV drivable IoU ≥ a Simple-BEV single-camera baseline trained by us; no stage-A metric down by > 1 |
+| **C: temporal** (weeks 7–9) | clip pairs / triplets from BDD MOT, nuScenes, Argoverse 2, Waymo, OpenLane sequences | query propagation, tracking by propagation, map streaming, ID embedding | 2 | ≥ +3 mAP 3D and ≥ +2 OpenLane F1 over the single-frame model at equal cost; BDD MOT mMOTA ≥ ByteTrack (45.5) and mIDF1 ≥ 54.8 |
+| **D: efficiency** (weeks 10–11) | stage-C data | SPARC-L → SPARC-S distillation, windowed attention, decoder depth / query counts, resolution ablation, INT8 of conv parts | 2 | ≤ 28 ms FP16 median on the Orin with all outputs; FP16 engine within the parity limits of Phase 0; INT8 kept only if faster at ≤ 0.5 point loss |
+| **E: own data** (when recorded) | own drives per `recording/protocol.md` + replay 0.5 | fine-tune; offline stereo depth as aux target; region signs; pseudo-labels from SPARC-L | 1 | per-source metrics on the 500-frame verified set; no public-benchmark regression > 1 |
 
-**Typed queries.** One self-attention over all 224 queries with a learnt type embedding (agents can attend to lanes);
-shared deformable cross-attention; per-type reference points: agent anchors from the top-k encoder tokens refined per
-layer (RT-DETR style); lane queries keep one reference point (polyline centroid) with larger learnt offsets. Lane
-output is CLRNet-like: 72 row anchors from y = 0.35 H to H, normalised x per row, per-row visibility.
+Total ≈ 19 GPU-days plus baselines (DEIMv2-S / RF-DETR-S on BDD, CLRerNet, Simple-BEV front, MonoDETR subset, ByteTrack): ≈ 3.
+The first deliverable that beats the current model on every output it shares (detection, drivable area, lanes,
+signs) is the end of stage A, about week 3.
 
-**Deformable attention** (`deform_attn.py`): `grid_sample`-based `MSDeformAttn` (RT-DETR's PyTorch path) → ONNX
-`GridSample` (opset 16), which TensorRT ≥ 8.5 has natively (RF-DETR/RT-DETR engines are built this way). Phase 0
-confirms it on JetPack 6.2 / TensorRT 10.3; fallback: 4-corner `GatherND` bilinear.
+### 4.1 Losses and matching (stage A onward)
+Hungarian matching per query type (agents and traffic elements: DEIM dense one-to-one with MAL; lanes: polyline L1 +
+existence). Every term is gated by `LabelMask` and normalised over the samples that carry it. Box: D-FINE distribution
+loss + GIoU; 3D: L1 on virtual log-depth, sin/cos yaw, log size; lanes: L1 on 3D points (3D sources) or on projected
+2D points (2D sources) + CE attributes; map: CE + Dice per layer, L1 heading on lane cells; depth-aux: CE over bins
+with LiDAR / stereo / pseudo-depth targets (pseudo-depth weighted 0.3); topology: BCE on element–lane pairs; ID:
+InfoNCE across the clip. Gains are fixed and calibrated once by the gradient-norm procedure already documented in
+`docs/training.md`.
 
-**Known-depth splat** (`bev.py::DepthSplat`, in-graph, static shapes): (1) P3 → 1×1 conv → (64,48,80); depth
-min-pooled ×8 (0 → +inf before pooling) → d (3840,); (2) back-project `[X,Y,Z] = K⁻¹[u·d, v·d, d]`, `ego = cam2ego·[X,Y,Z,1]`
-(constant pixel grid, `MatMul`); (3) cell index `floor((48−x)/0.2)·160 + floor((y+16)/0.2)`; invalid (d = 0, outside
-the grid, height outside [−1, 3] m) → a dump cell; (4) `ScatterElements(reduction="add")` of features and of a ones
-channel into (65, 38401), divide by count (mean splat), drop the dump cell, reshape (64,240,160). Ops: MatMul, Mul,
-Div, Floor, Clip, Cast, Where, ScatterElements. **Uncertain:** ScatterElements-add in TensorRT 10.3's parser — Phase 0
-probes it. Fallbacks in order: one-hot `Equal`+`MatMul` splat at a 0.4 m grid (9600 cells, ~1 GFLOP); a ~40-line
-`bev_pool` plugin; two engines with `index_add_` in between (breaks the single-engine goal, documented).
+## 5. Ablations that decide the design (one table in `docs/sparc/results.md`)
 
-**IPM branch** (`IPMSampler`): constant cell-centre matrix (38400,4) at z = 0 → `K[R|t]⁻¹` from `cam2ego` → (u, v) →
-`grid_sample` on the reduced P3 → (64,240,160); cells behind the camera / above the horizon masked.
+| id | question | compared |
+|---|---|---|
+| A1–A3 | backbone (bake-off top-2) and recipe | DEIM vs plain Hungarian; DINOv3 teacher on/off |
+| B1 | BEV lifting | depth-free deformable sampling vs v1 depth splat (with LiDAR depth) vs IPM-only |
+| B2 | depth input at inference | none / foundation pseudo-depth / LiDAR-quality / corrupted (noise, holes, 2× scale error): the model must degrade gracefully |
+| B3 | loss weighting | fixed calibrated gains vs uncertainty weighting |
+| B4 | virtual camera | on vs off (3D AP across datasets) |
+| B5 | drivable area | image head vs rendered from BEV |
+| C1 | temporal | single frame vs propagation; with measured vs noisy ego-motion (±10 % scale, ±2° yaw) |
+| C2 | tracking | propagation only vs propagation + ID embedding vs ByteTrack on the same detections |
+| D1 | stereo head | with vs without, accuracy of 3D / BEV vs cost |
+| D2 | resolution | 384×640 vs 448×768 (small signs / lights recall vs ms) |
+| D3 | precision | FP16 vs mixed INT8 on the Orin |
 
-**BEVDecoder**: concat [splat 64, IPM 64, valid 1] → 3×3 stride 2 → 4 residual blocks @96 ch on 120×80 → upsample →
-head (7,240,160): drivable (3 logits), lane line (1), heading sin/cos (2), agent occupancy (1, auxiliary; at inference
-footprints are rasterised on the CPU from the tracked 3D states).
+## 6. Risks specific to public-data-first
 
-**Budget check** (Phase 0): `sparc/utils/profile.py` (FlopCounterMode per submodule, as `adas_mt/utils/profile.py`),
-then `trtexec --dumpProfile --useCudaGraph` on the Orin per stage (`export --until backbone|encoder|decoder|bev`).
-Knobs if over 33 ms: N backbone variant, 320×576 input, 2 decoder layers, BEV at 0.4 m, INT8 backbone.
+1. **Camera domain gap**: public front cameras range from 50° (Waymo) to 80° (KITTI) FOV; the virtual camera removes
+   intrinsics differences, not viewpoint height (1.2–2.2 m) → cam2ego is an input and height is augmented ±0.3 m.
+2. **Label conflicts across sources** (BDD "lane" means marking; OpenLane-V2 "lane" means centerline) → separate
+   query roles (markings vs centerlines are different targets of the lane queries' type head), per-source metrics.
+3. **Sign taxonomy** differs by country → unified vocabulary with masking; the shipped model is fine-tuned on the
+   deployment region.
+4. **Pseudo-depth quality** on BDD → weight 0.3 and B2 measures robustness to wrong depth.
+5. **Temporal training cost** (clips double the data loader work) → pairs/triplets only, cached encoder features for
+   the backbone-frozen phase of stage C.
+6. **TensorRT support** for the new pieces: deformable sampling (GridSample, already probed), the BEV warp (GridSample),
+   top-k with dynamic memory (made static: fixed k with validity mask) → Phase-0 probes extended before stage C.
 
-## 4. Training layer
+## 7. What is new and what is not
 
-**Why not the Ultralytics trainer.** It owns the model type (`DetectionModel`, TAL assigner), the batch dict
-(`img/cls/bboxes/batch_idx`), one `YOLODataset`, `get_cfg` validation, and `DetMetrics` over a `(B,300,6)` tensor.
-SPARC needs multi-input forward, Hungarian matching, list-valued targets, clip pairs, weighted mixing and seven
-evaluators.
+Taken from published work: DINOv3 / DINOv2 trunks and spatial adapters (DEIMv2, RF-DETR); hybrid encoder, deformable
+attention and query selection (RT-DETR); DEIM matching; D-FINE box distributions; depth-aware queries (MonoDETR);
+auxiliary depth supervision (BEVDepth); depth-free query lifting (BEVFormer, Simple-BEV); temporal query propagation
+(StreamPETR, Sparse4D, StreamMapNet); topology heads (TopoNet / TopoMLP); virtual camera (Omni3D); modality dropout
+(UniBEV).
 
-**Lean trainer** (`sparc/engine/trainer.py`, ~400 lines, grown from `adas_mt/distill/pretrain.py`): AdamW (backbone
-LR ×0.1), linear warm-up + cosine, `torch.autocast` bf16/fp16 + `GradScaler`, grad-clip 0.1 (DETR practice), EMA with
-the Ultralytics decay ramp (`ema.py`), `torchrun` DDP through the mixed sampler, `last.pt` = {model, ema, optimizer,
-scaler, scheduler, epoch, rng, sampler state}, `results.csv` + `run.yaml` (the `mt.yaml` record; `SparcConfig` reuses
-`MTConfig`'s strict `from_dict`/`find_run_cfg`/`save`), per-source metric rows every epoch, `colab/train_sparc.ipynb`
-with the existing cell sequence.
+New in this design, and testable:
+1. **One temporal decoder whose typed queries cover road users, traffic elements, lanes, the BEV map and their
+   topology on a single front camera**, propagated jointly with measured ego-motion; published systems do one or two
+   of these, and the map / topology ones on multi-camera rigs with server GPUs.
+2. **Depth-optional training**: a single network that uses a depth input when present and is measured (B2) to lose
+   nothing when it is absent or corrupted.
+3. **3D lanes supervised from 2D-only datasets through the projection**, which makes CULane / BDD / CurveLanes usable
+   for a 3D lane head and gives order and direction labels from maps instead of hand rules.
 
-**Criterion** (`nn/loss.py`): `HungarianMatcher` per query type (agents: focal cls + L1 + GIoU; lanes: row-x L1 +
-existence); every loss gated by `label_mask` and averaged over the **samples carrying that label** (not the batch),
-so rare tasks are not diluted. Terms: 2D focal/Null-BCE over `cls_vocab` + L1 + GIoU | 3D: L1 log-depth, sin/cos yaw,
-L1 dims | lanes: L1 x, BCE visibility/existence, CE attributes (weak ×0.3) | DA: `masked_ce + masked_dice` (imported
-from `adas_mt.nn.loss`) | lane-aux: `masked_ce + masked_focal_tversky` | BEV: CE + Dice per layer, L1 heading on lane
-cells | ID: MOTIP-style ID classification over per-clip ID slots + InfoNCE across the frame pair | auxiliary losses on
-every decoder layer.
+Expected magnitude, from the cited numbers: foundation features +2–4 AP; temporal propagation the largest single
+step (double digits in 3D on nuScenes in the literature; unknown for a single front camera until stage C);
+everything else one to two points each. These are the only promises this document makes.
 
-**Loss weighting: fixed gains, calibrated once.** Uncertainty weighting drifts for tasks absent from most batches and
-GradNorm doubles the backward cost; `engine/balance.py` logs the gradient L2 norm reaching the encoder per task over
-200 steps and the gains are set so every task lands within 0.3–3× of detection, recorded in `run.yaml` (the
-`adas_mt` measurement in `docs/training.md` is the precedent). Uncertainty weighting is ablation B3.
+## 8. Code changes relative to Phase 0
 
-**Curriculum** (`cfg/stage*.yaml`, each stage resumes the previous `best.pt`):
+| area | change |
+|---|---|
+| `sparc/data/schema.py` | add `elements` (traffic elements with attribute + fine class), `lanes3d`, `topology`, `ego_motion`; virtual-camera fields |
+| `sparc/data/converters/` | bdd100k, culane, curvelanes, openlane, openlane_v2, nuscenes_front, argoverse2_front, waymo_front, zod, mtsd, tt100k, dtld/bosch/lisa, drivingstereo; `virtual_camera.py` |
+| `sparc/nn/decoder.py` | traffic-element and map query types; temporal memory in/out; topology head |
+| `sparc/nn/bev.py` | `QueryLifter` (deformable sampling at 4 heights) replaces `DepthSplat` as the default; splat kept for B1 |
+| `sparc/nn/depth.py` | auxiliary depth head with depth-input fusion and dropout |
+| `sparc/nn/lanes.py` | 3D polyline head + differentiable projection to the image |
+| `sparc/engine/` | lean trainer with clip sampling, DEIM matching, label-mask gating, per-source metrics (stage A first) |
+| `sparc/tools/bakeoff.py` | probes for the BEV warp and the static top-k memory |
 
-| stage | data (sampler weights) | new losses | A100 GPU-days |
-|---|---|---|---|
-| 1 | BDD det+DA+lanes (0.5), CULane (0.25), MTSD (0.25) | 2D, attributes, lanes, DA, KD | ~1.5 / run |
-| 2 | + nuScenes front (0.4), Stage-1 replay (0.6) | 3D, BEV (splat + IPM) | ~1 |
-| 3 | BDD MOT clip pairs (0.5), replay (0.5) | ID | ~1 |
-| 4 | own drives (0.5: labelled + pseudo + self-BEV), replay (0.5) | all, backbone LR ×0.1 | ~0.5 |
-
-**Distillation hook** (`distill/hook.py`): `FrozenTeacher("dinov3_b")` on the 24×40 patch grid, `KDProjector` on
-encoder P4, `distill_terms`, cosine-decayed weight; on in Stage 1 (also for DINO-initialised backbones: it
-regularises the encoder), off in Stage 4. This is the teacher's role in one sentence: +1.5–3 AP at equal latency,
-as measured by RT-DETRv4/DEIMv2, because the student's features are pulled towards foundation features it could
-never learn from 100k driving images alone.
-
-**Ablation protocol** (`docs/sparc/results.md`, one table): A0 `adas_mt` YOLO26s; RF-DETR-S fine-tuned on BDD; A1
-Stage 1 without KD; A2 Stage 1 + KD; A3 + Stage 2 (does 3D/BEV cost 2D mAP?); A4 + Stage 3 vs ByteTrack; A5 + Stage
-4; B1 BEV splat-only / IPM-only / both vs LSS front-cam; B2 depth input: LiDAR-completed / mono pseudo-depth / none;
-B3 fixed vs uncertainty weighting; B4 backbone (Phase 0). Metrics: BDD det mAP (pycocotools), BDD MOT mMOTA/mIDF1
-(`bdd100k` toolkit), CULane F1@50 (own numpy port of the 30-px IoU F1, validated against CLRNet's released
-predictions), BDD DA mIoU, nuScenes front-cam AP@{0.5,1,2,4} m (devkit with a CAM_FRONT visibility filter; MonoDETR
-re-evaluated on the same subset), BEV IoU drivable/divider, MTSD top-1 given GT boxes vs `sign_classifier/`, Orin ms
-per output.
-
-## 5. Deployment layer
-
-**Engine contract** (`sparc/deploy/export.py`; meta JSON as today). Inputs: `image` f32 (1,3,384,640) RGB/255
-letterboxed rectified left eye; `K` f32 (1,3,3) at network pixels (letterbox-adjusted); `cam2ego` f32 (1,4,4); then
-either `depth` f32 (1,1,384,640) in m, letterboxed nearest, pad 0 (D2, or any external depth), or `image_right` f32
-(1,3,384,640) + `baseline` f32 (1,1) in m (D1, in-network stereo, which also outputs `depth`). Outputs: `agents` f32 (1,200,18) = xyxy, score, cls, depth, sin, cos,
-l, w, h, x_ego, y_ego, tl_id, tl_p, sign_id, sign_p; `agent_emb` f16 (1,200,64); `lane_xs`/`lane_vis` f32 (1,24,72);
-`lane_meta` f32 (1,24,9) = exist + (id, p) for order/dir/cont/type; `da` uint8 (1,384,640); `bev` f16 (1,7,240,160).
-
-**Post-processing** (CPU, `sparc/track/`): `associate.py`: ego-motion from IMU/GPS moves the previous 3D positions
-into the current ego frame; cost = (1 − cos(emb)) + λ·‖Δxyz‖/σ_cls; Hungarian (scipy); ByteTrack-style two-tier
-confirmation; 2D fallback when depth is missing. `bev_accum.py`: log-odds BEV accumulated over time, warped by
-ego-motion (`cv2.warpAffine` on 240×160), decay 0.9; agent footprints rasterised from the tracked 3D states.
-`SparcPipeline` (`deploy/runner.py`) wraps the `adas_mt.deploy.runner` backends and timing.
-
-**Latency plan**: FP16 first, per-stage `trtexec` profile; INT8 later with calibration on own-drive frames
-(multi-input calibrator). Kept in FP16: LayerNorm/softmax/attention of the ViT, deformable sampling offsets, 3D
-regression, the BEV head. `_pin_fp16` becomes a `precision_map` in the meta.
-
-**Recording specification**: `recording/protocol.md` (rig-agnostic): hardware-synchronised stereo pair recorded raw
-(both eyes, exposure timestamps), raw IMU at its output rate stamped at sample time, GNSS stamped with its own fix
-time, optional vehicle speed, OpenCV-format calibration with camera-to-ego and camera-to-IMU, per-drive acceptance
-checks, offline depth labels at full resolution and future-near BEV accumulation.
-
-## 6. Phases, acceptance tests, GPU budget, risks
-
-| phase (weeks) | deliverables | acceptance (CPU tests on `sparc/data/synthetic.py`, pattern of `tests/test_adas_mt`) | on the Orin |
-|---|---|---|---|
-| 0 (2) | `sparc/` scaffold, `BackboneFactory`, `bakeoff` CLI (3 backbones → ONNX → Orin), op probes (GridSample, ScatterElements-add, LayerNorm fp16), `recording/protocol.md`, `schema.py` | schema round-trip; profile table; probe graphs pass `audit_ops` | bake-off table (ms + mAP after a 1-epoch BDD fine-tune, 0.5 GPU-day); op verdicts |
-| 1 (3) | converters BDD/CULane/MTSD, `lane_rules.py`, `MixedDataset`, `augment.py` | flip/scale keep K–box–polyline–mask–BEV consistent on synthetic geometry; label masks per source; sampler weights within 2 % | — |
-| 2 (3) | encoder/decoder/2D heads/lanes/DA, criterion, trainer, evaluators det/CULane/DA/sign, export + parity, **Stage 1** | 2-epoch learning test on synthetic data (mAP50 > 0.9, lane F1 > 0.8, DA IoU > 0.6), resume equality, ONNX parity | FP16 engine without BEV, `bench` ≤ 25 ms |
-| 3 (3) | nuScenes converter, 3D head, `bev.py`, BEV evaluators, **Stage 2** | splat test: synthetic points land in the right cells; IPM of a flat plane reproduces a checkerboard; export audit | one engine with BEV, ≤ 33 ms |
-| 4 (2) | MOT converter, ID head, `associate.py`, MOT evaluator, **Stage 3** | association recovers synthetic tracks under ego-motion; `bdd100k` eval runs | — |
-| 5 (parallel) | `record.py`, `own_drive.py`, pseudo-label + self-BEV label tools, **Stage 4** | self-BEV on nuScenes (LiDAR as the fake depth camera, CAN bus as IMU/GPS) reaches map IoU > 0.6 against the HD map | first drives |
-| 6 (2) | INT8, runner post-processing, ablation table, docs, Colab | bench JSON; FP16 engine vs ONNX eval parity | final numbers |
-
-GPU-days (A100): Stage 1 ×4 runs 6, Stage 2 ×2 2, Stage 3 1, Stage 4 1, baselines (RF-DETR-S, YOLO26s, LSS) 2,
-bake-off 0.5 → **~13–15 GPU-days** total. First milestone that already beats the current model: end of Phase 2.
-
-**Risk register**
-1. Deformable attention export → `GridSample` probe in Phase 0; `GatherND` fallback.
-2. ViT FP16 overflow on Jetson → LayerNorm/softmax pinned to FP32; ConvNeXt-T as the clean-CNN escape; FP16-engine vs
-   fp32-ONNX eval parity is a gate.
-3. Licences (nuScenes / MTSD / CULane non-commercial) → `licence` field + `--commercial` manifest filter; a research
-   model and a product model (BDD + own drives + Stage 4) are trained from separate manifests; weights derived from
-   non-commercial data are not shipped in a product.
-4. Weak direction/order labels → weight 0.3; the verified set is the only reported number; CULane gives clean order.
-5. No drives yet → protocol first; nuScenes stands in for the whole own-drive pipeline (dry run in Phase 5).
-6. Latency overrun → per-module trtexec budget table; knobs in section 3.
-7. Multi-dataset gradient conflict → per-task sample normalisation, replay ratios, calibrated gains, per-source
-   metrics every epoch; PCGrad only if a source regresses > 1 point.
-8. Stereo depth range (~24 m at network width) → depth labels offline at full resolution, future-near accumulation for
-   the far BEV, training clips the input depth to a random range in [8, 40] m with holes/noise, IPM covers beyond;
-   BEV IoU reported per range band (0–10 / 10–25 / 25–48 m).
-9. Runtime stereo cost → D1 / D2 / D3 measured on the device (Phase 0) and ablated for accuracy (Phase 3, B2).
-
-## Verification (end to end)
-
-- CPU: `pytest tests/test_sparc` (schema, converters on synthetic dumps, augmentation geometry, matcher/loss gating,
-  splat/IPM unit tests, trainer learning test, export parity with ORT, fake-TensorRT multi-input runner).
-- GPU: Stage-1 run on BDD+CULane+MTSD with the ablation table (A0–A2) before any 3D/BEV work; each later stage adds its
-  row and must not regress the earlier metrics by > 1 point.
-- Orin: Phase-0 bake-off and op probes with `trtexec`; `sparc bench` per output; `sparc eval` of the FP16 engine vs
-  the ONNX on the same val split.
-- Own data: recording protocol executed; `own_drive.py` + self-BEV labels validated first on nuScenes (map IoU > 0.6).
-
-## Open points the user decides later
-- Which backbone wins the Phase-0 bake-off (latency vs mAP on the device).
-- Recording start date (the specification is ready) and the rectification alpha (field of view vs valid area).
-- Licences: settled 2026-10-11 — research use, all datasets in one training manifest (the `licence` field stays for
-  provenance).
+## Sources
+- RF-DETR: https://rfdetr.roboflow.com/ ; DEIMv2 "Real-Time Object Detection Meets DINOv3": https://arxiv.org/abs/2509.20787 ;
+  DEIM: https://arxiv.org/abs/2412.04234
+- StreamPETR: https://arxiv.org/abs/2303.11926 ; Sparse4Dv3: https://arxiv.org/abs/2311.11722 ; StreamMapNet: https://arxiv.org/abs/2308.12570
+- Simple-BEV: https://arxiv.org/abs/2206.07959 ; UniBEV (modality dropout): https://arxiv.org/abs/2309.14516
+- Omni3D / Cube R-CNN virtual depth: https://arxiv.org/abs/2207.10660 ; MonoDETR: https://arxiv.org/abs/2203.13310 ;
+  MonoDINO-DETR: https://arxiv.org/abs/2502.00315 ; UniDepth: https://openaccess.thecvf.com/content/CVPR2024/papers/Piccinelli_UniDepth_Universal_Monocular_Metric_Depth_Estimation_CVPR_2024_paper.pdf
+- OpenLane: https://github.com/OpenDriveLab/OpenLane ; OpenLane-V2: https://github.com/OpenDriveLab/OpenLane-V2 ;
+  OpenLane leaderboard (aggregator): https://hyper.ai/en/sota/tasks/3d-lane-detection/benchmark/3d-lane-detection-on-openlane
+- ZOD: https://zod.zenseact.com/annotations/ and https://arxiv.org/abs/2305.02008 ; Argoverse 2: https://www.argoverse.org/av2 ;
+  Waymo camera-only 3D: https://waymo.com/open/challenges/2022/3d-camera-only-detection/ ; DrivingStereo: https://openaccess.thecvf.com/content_CVPR_2019/html/Yang_DrivingStereo_A_Large-Scale_Dataset_for_Stereo_Matching_in_Autonomous_Driving_CVPR_2019_paper.html
+- Traffic lights (DTLD, LISA, Bosch): https://arxiv.org/abs/2409.07284 ; UCMCTrack: https://arxiv.org/abs/2312.08952
+- BDD100K multi-task numbers under one protocol: https://arxiv.org/abs/2511.05557
+- Orin INT8 / sparsity reports: https://forums.developer.nvidia.com/t/worse-performance-after-quantization-on-tensorrt/355549 ,
+  https://forums.developer.nvidia.com/t/stuctured-sparsity-2-4-does-not-improve-inference-performance-on-jetson-orin/263685

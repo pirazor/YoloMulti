@@ -19,9 +19,10 @@ legacy/yolov13/ previous YOLOv13 multi-task implementation (frozen baseline)
 
 ## SPARC (in progress)
 
-One sparse-query network for a stereo camera + IMU + GNSS on a Jetson Orin: road users with 3D state and
-tracking embeddings, traffic-light colour and fine sign class, lanes with ego order and travel direction,
-drivable area, and a depth-grounded BEV map ([design](docs/sparc/plan.md)). Phase 0
+One temporal sparse-query network for a front camera + IMU + GNSS on a Jetson Orin: road users with 3D state and
+tracking, traffic-light colour and fine sign class, lanes with ego order and travel direction, drivable area, a BEV
+map and light-to-lane topology. Depth is an auxiliary signal (optional input, training target), never a dependency;
+training starts on public datasets ([design and plan](docs/sparc/plan.md)). Phase 0
 ([report](docs/sparc/phase0.md)) measures the backbone candidates and the TensorRT-critical ops on the device:
 
 ```bash
