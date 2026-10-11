@@ -1,4 +1,4 @@
-"""``python -m sparc <rig|profile|bakeoff> ...``"""
+"""``python -m sparc <prepare|convert|synth|train|val|export|rig|profile|bakeoff> ...``"""
 
 from __future__ import annotations
 
@@ -67,6 +67,55 @@ def cmd_val(a: argparse.Namespace) -> int:
     print(json.dumps(res, indent=1))
     (Path(a.out) / "val.json").write_text(json.dumps(res, indent=1))
     return 0
+
+
+def cmd_export(a: argparse.Namespace) -> int:
+    """Trained checkpoint -> ONNX (engine I/O contract of SparcDeploy) + a JSON sidecar with the vocabularies."""
+    import numpy as np
+    import torch
+
+    from sparc.data import virtual_camera as vc
+    from sparc.data.schema import (AGENT_CLASSES, DA_CLASSES, ELEMENT_ATTRS, ELEMENT_CLASSES, LANE_CONTINUITY,
+                                   LANE_DIRECTIONS, LANE_TYPES, LANE_X_ANCHORS, ground_cam2ego)
+    from sparc.deploy.export import embed_meta, export_graph
+    from sparc.engine.trainer import load_for_eval
+    from sparc.nn.model import AGENT_COLUMNS, ELEMENT_COLUMNS, LANE_META_COLUMNS, SparcDeploy, example_inputs
+
+    model, vocab, cfg = load_for_eval(a.weights, "cpu")
+    cam = vc.VirtualCamera(tuple(cfg.model.imgsz), cfg.model.hfov)
+    K = torch.tensor(cam.K, dtype=torch.float32)
+    T = torch.tensor(ground_cam2ego(a.cam_height, np.radians(a.pitch_deg)), dtype=torch.float32)
+    dep = SparcDeploy(model)
+    inputs = example_inputs(model, K=K, cam2ego=T)
+    if a.image:  # a real frame gives a meaningful parity check (detections, lanes) instead of a smooth random image
+        import cv2
+
+        img = cv2.cvtColor(cv2.imread(a.image), cv2.COLOR_BGR2RGB)
+        Ks = vc.nominal_K(img.shape[:2], hfov_deg=a.image_hfov)
+        warped = vc.warp_image(img, vc.intrinsics_affine(Ks, cam.K), cam.hw)
+        inputs["image"] = torch.from_numpy(warped).permute(2, 0, 1)[None].float() / 255.0
+    out = Path(a.out or Path(a.weights).with_suffix(".onnx"))
+    info = export_graph(dep, inputs, out, dep.output_names(), opset=a.opset, check=True)
+    meta = {"format": "sparc", "version": 1, "weights": str(a.weights), "inputs": info.inputs, "outputs": info.outputs,
+            "virtual_camera": {"hw": list(cam.hw), "hfov_deg": cam.hfov_deg, "K": cam.K.tolist()},
+            "agent_classes": list(AGENT_CLASSES), "element_classes": list(ELEMENT_CLASSES),
+            "element_attrs": list(ELEMENT_ATTRS), "signs": vocab.names, "da_classes": list(DA_CLASSES),
+            "lane_x_anchors": [float(x) for x in LANE_X_ANCHORS], "lane_directions": list(LANE_DIRECTIONS),
+            "lane_continuity": list(LANE_CONTINUITY), "lane_types": list(LANE_TYPES),
+            "columns": {"agents": list(AGENT_COLUMNS), "elements": list(ELEMENT_COLUMNS), "lane_meta": list(LANE_META_COLUMNS)},
+            "preprocess": "undistort + rectify to a pinhole, warp into the virtual camera (K_v K_rig^-1), RGB / 255",
+            "audit": info.audit, "ort_parity": info.parity}
+    embed_meta(out, meta)
+    out.with_suffix(".json").write_text(json.dumps(meta, indent=1))
+    print(json.dumps({"onnx": str(out), "mbytes": round(info.mbytes, 1), "audit": info.audit,
+                      "parity": info.parity}, indent=1))
+    return 0
+
+
+def cmd_prepare(a: argparse.Namespace) -> int:
+    from sparc.tools.prepare import main as prepare_main
+
+    return prepare_main(a.rest)
 
 
 def cmd_synth(a: argparse.Namespace) -> int:
@@ -142,6 +191,20 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--device", default=None)
     v.add_argument("--workers", type=int, default=None)
     v.set_defaults(fn=cmd_val)
+
+    e = sub.add_parser("export", help="trained checkpoint -> ONNX for TensorRT (+ JSON sidecar)")
+    e.add_argument("--weights", required=True)
+    e.add_argument("--out", default=None, help="output .onnx (default: next to the weights)")
+    e.add_argument("--image", default=None, help="a real frame for the onnxruntime parity check")
+    e.add_argument("--image-hfov", type=float, default=65.0, help="horizontal FOV guess of --image (deg)")
+    e.add_argument("--cam-height", type=float, default=1.4, help="camera height used for the example cam2ego (m)")
+    e.add_argument("--pitch-deg", type=float, default=0.0)
+    e.add_argument("--opset", type=int, default=17)
+    e.set_defaults(fn=cmd_export)
+
+    pp = sub.add_parser("prepare", help="dataset archives -> converted sources + manifests: prepare -- --datasets DIR --work DIR")
+    pp.add_argument("rest", nargs=argparse.REMAINDER)
+    pp.set_defaults(fn=cmd_prepare)
 
     sy = sub.add_parser("synth", help="write a synthetic dataset: synth -- --dst DIR [--n-train N --n-val M]")
     sy.add_argument("rest", nargs=argparse.REMAINDER)

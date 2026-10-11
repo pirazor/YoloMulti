@@ -93,6 +93,26 @@ def test_smoke_training_runs_resumes_and_evaluates(syn, tmp_path):
                  "--out", str(tmp_path / "valrun"), "--device", "cpu", "--workers", "0"]) == 0
     res = json.loads((tmp_path / "valrun" / "val.json").read_text())
     assert "fitness" in res and "synthetic/lane_F1" in res
+    # export: ONNX + sidecar with the vocabularies, parity checked against PyTorch inside the command
+    assert main(["export", "--weights", str(out / "weights" / "best.pt"), "--out", str(tmp_path / "m.onnx")]) == 0
+    side = json.loads((tmp_path / "m.json").read_text())
+    assert side["signs"] == tr.vocab.names and side["audit"]["unsupported"] == [] and len(side["lane_x_anchors"]) == 20
+    assert set(side["inputs"]) == {"image", "K", "cam2ego"} and side["outputs"]["agents"][-1] == 14
+
+
+def test_val_every_and_even_subsets(syn, tmp_path):
+    from sparc.data.dataset import SparcDataset
+    from sparc.data.vocab import SignVocab
+
+    full = SparcDataset(syn, "train", SignVocab.from_manifests([syn]))
+    sub = SparcDataset(syn, "train", SignVocab.from_manifests([syn]), limit=3)
+    assert [f.name for f in sub.files] == [full.files[i].name for i in (0, 4, 7)]  # spread, not the first three
+    cfg = TrainCfg.load(CFG, {"epochs": 3, "epoch_size": 4, "batch": 4, "workers": 0, "val_every": 2})
+    tr = Trainer(cfg, DataCfg.load(_manifest(tmp_path, syn)), tmp_path / "run", device="cpu")
+    tr.fit()
+    validated = [r["epoch"] for r in tr.history if "fitness" in r]
+    assert validated == [2, 3]  # every 2nd epoch and always the last
+    assert all("train/img_per_s" in r and "train/data_wait_frac" in r for r in tr.history)
 
 
 def test_train_cli_and_synth_cli(tmp_path):

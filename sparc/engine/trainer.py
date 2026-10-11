@@ -102,6 +102,10 @@ class Trainer:
         else:
             self.device = torch.device(device or ("cuda:0" if torch.cuda.is_available() else "cpu"))
         self.main = self.rank == 0
+        if self.device.type == "cuda":  # TF32 matmuls / convs (Ampere+) for the fp32 parts; fixed input size -> cuDNN autotune
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
         if self.main:
             (self.out / "weights").mkdir(parents=True, exist_ok=True)
         torch.manual_seed(cfg.seed + self.rank)
@@ -121,7 +125,7 @@ class Trainer:
         self.sampler = WeightedSourceSampler(self.mixed, cfg.epoch_size, cfg.seed, self.rank, self.world)
         self.train_loader = DataLoader(self.mixed, batch_size=cfg.batch, sampler=self.sampler, num_workers=cfg.workers,
                                        collate_fn=collate, pin_memory=self.device.type == "cuda", drop_last=True,
-                                       persistent_workers=cfg.workers > 0)
+                                       persistent_workers=cfg.workers > 0, prefetch_factor=4 if cfg.workers > 0 else None)
         self.val_sets = [SparcDataset(s.root, s.split or "val", self.vocab, self.camera, None, limit=s.limit) for s in data.val]
         # model, loss, optimiser
         self.model = build_model(cfg, len(self.vocab)).to(self.device)
@@ -193,16 +197,20 @@ class Trainer:
         sums: Dict[str, float] = {}
         n = 0
         t0 = time.time()
+        wait = 0.0
+        t_ready = time.time()
         for i, batch in enumerate(self.train_loader):
+            wait += time.time() - t_ready  # time spent waiting for the data loader
             image, out = self._forward(batch)
             out = {k: (v.float() if torch.is_tensor(v) and v.is_floating_point() else v) for k, v in out.items()}
             if "aux" in out:
                 out["aux"] = [{k: v.float() for k, v in a.items()} for a in out["aux"]]
             loss, items = self.criterion(out, batch)
             if self.distill is not None:
-                kd = self.distill(image, out["enc_feats"][1].float(), self.step / max(1, self.total_steps))
-                loss = loss + kd["kd"]
-                items["kd"] = float(kd["kd"])
+                with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_dtype is not None):
+                    kd = self.distill(image, out["enc_feats"][1].float(), self.step / max(1, self.total_steps))
+                loss = loss + kd["kd"].float()
+                items["kd"] = float(kd["kd"].detach())
                 items["kd_cos"] = float(kd["kd_cos"])
             self.optimizer.zero_grad(set_to_none=True)
             self.scaler.scale(loss).backward()
@@ -218,11 +226,20 @@ class Trainer:
             for k, v in items.items():
                 sums[k] = sums.get(k, 0.0) + v
             if self.main and (i + 1) % self.cfg.log_every == 0:
-                LOG.info("epoch %d  it %d/%d  loss %.3f  (cls %.3f l1 %.3f giou %.3f lane_y %.3f da %.3f)  gn %.2f  lr %.2e  %.1f it/s",
-                         self.epoch, i + 1, self.steps_per_epoch, items["total"], items["cls"], items["l1"], items["giou"],
-                         items["lane_y"], items.get("da_ce", 0.0), float(gn), self.optimizer.param_groups[0]["lr"],
-                         (i + 1) / (time.time() - t0))
-        return {f"train/{k}": v / max(n, 1) for k, v in sums.items()}
+                el = time.time() - t0
+                LOG.info("epoch %d  it %d/%d  loss %.3f  (cls %.3f l1 %.3f giou %.3f lane_y %.3f da %.3f)  gn %.2f  lr %.2e  "
+                         "%.1f img/s  data wait %.0f%%", self.epoch, i + 1, self.steps_per_epoch, items["total"], items["cls"],
+                         items["l1"], items["giou"], items["lane_y"], items.get("da_ce", 0.0), float(gn),
+                         self.optimizer.param_groups[0]["lr"], (i + 1) * self.cfg.batch / el, 100 * wait / max(el, 1e-9))
+            t_ready = time.time()
+        el = time.time() - t0
+        out = {f"train/{k}": v / max(n, 1) for k, v in sums.items()}
+        out["train/img_per_s"] = n * self.cfg.batch * self.world / max(el, 1e-9)
+        out["train/data_wait_frac"] = wait / max(el, 1e-9)
+        out["train/epoch_min"] = el / 60
+        if self.device.type == "cuda":
+            out["train/gpu_mem_gb"] = torch.cuda.max_memory_allocated(self.device) / 2 ** 30
+        return out
 
     # ------------------------------------------------------------------ validation
     @torch.no_grad()
@@ -232,7 +249,8 @@ class Trainer:
         bs = self.cfg.val_batch or self.cfg.batch
         for ds in self.val_sets:
             ev = SourceEvaluator(ds.source, self.device)
-            loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=self.cfg.workers, collate_fn=collate)
+            loader = DataLoader(ds, batch_size=bs, shuffle=False, num_workers=self.cfg.workers, collate_fn=collate,
+                                pin_memory=self.device.type == "cuda")
             for batch in loader:
                 image = batch["image"].to(self.device).float() / 255.0
                 with torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_dtype is not None):
@@ -258,19 +276,25 @@ class Trainer:
             self.epoch += 1
             row = {"epoch": self.epoch, **train_items}
             if self.main:
-                val = self.validate()
+                do_val = self.epoch == cfg.epochs or (cfg.val_every > 0 and self.epoch % cfg.val_every == 0)
+                val = self.validate() if do_val else {}
                 row.update(val)
                 row["time_s"] = time.time() - t0
                 self.history.append(row)
                 self._write_results(row)
-                improved = val["fitness"] > self.best
-                self.best = max(self.best, val["fitness"])
+                improved = do_val and val["fitness"] > self.best
+                if do_val:
+                    self.best = max(self.best, val["fitness"])
                 self.save(self.out / "weights" / "last.pt")
                 if improved:
                     self.save(self.out / "weights" / "best.pt")
-                LOG.info("epoch %d/%d  train loss %.3f  fitness %.4f (best %.4f)  %s", self.epoch, cfg.epochs,
-                         train_items.get("train/total", 0.0), val["fitness"], self.best,
-                         "  ".join(f"{k}={v:.3f}" for k, v in sorted(val.items()) if "/" in k and ("mAP50-95" in k or k.endswith("mIoU") or k.endswith("lane_F1"))))
+                if do_val:
+                    LOG.info("epoch %d/%d  train loss %.3f  %.0f img/s  fitness %.4f (best %.4f)  %s", self.epoch, cfg.epochs,
+                             train_items.get("train/total", 0.0), train_items["train/img_per_s"], val["fitness"], self.best,
+                             "  ".join(f"{k}={v:.3f}" for k, v in sorted(val.items()) if "/" in k and ("mAP50-95" in k or k.endswith("mIoU") or k.endswith("lane_F1"))))
+                else:
+                    LOG.info("epoch %d/%d  train loss %.3f  %.0f img/s  (no validation this epoch)", self.epoch, cfg.epochs,
+                             train_items.get("train/total", 0.0), train_items["train/img_per_s"])
                 last = row
             if self.distributed:
                 torch.distributed.barrier()

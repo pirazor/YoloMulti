@@ -76,6 +76,7 @@ class TrainCfg:
     epoch_size: Optional[int] = None  # items per epoch (default: the sum of the source sizes)
     seed: int = 0
     log_every: int = 50
+    val_every: int = 1             # validate every N epochs (0 = only after the last epoch); the last epoch always validates
     val_batch: Optional[int] = None
     min_score: float = 0.01
 
@@ -111,7 +112,7 @@ class SourceCfg:
     root: str
     weight: float = 1.0
     split: Optional[str] = None   # defaults: train for training sources, val for validation sources
-    limit: Optional[int] = None   # first N samples (smoke tests)
+    limit: Optional[int] = None   # N evenly spaced samples (quick runs, fast in-training validation)
 
 
 @dataclass

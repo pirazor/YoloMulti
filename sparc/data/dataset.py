@@ -77,8 +77,10 @@ class SparcDataset(Dataset):
         self.root, self.split, self.vocab, self.camera, self.aug, self.anchors = Path(root), split, vocab, camera, augment, anchors
         self.sample_dir = self.root / split / "samples"
         self.files = sorted(self.sample_dir.glob("*.npz"))
-        if limit is not None:
-            self.files = self.files[:limit]
+        if limit is not None and limit < len(self.files):
+            # evenly spaced over the sorted files: a subset that covers every clip / city, not just the first ones
+            idx = np.linspace(0, len(self.files) - 1, num=max(1, int(limit))).round().astype(int)
+            self.files = [self.files[i] for i in np.unique(idx)]
         if not self.files:
             raise FileNotFoundError(f"no samples in {self.sample_dir}")
         import json
