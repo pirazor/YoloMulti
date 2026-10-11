@@ -18,22 +18,31 @@ NAMES = ("pedestrian", "rider", "car", "truck", "bus", "train", "motorcycle", "b
 
 
 def _check_box_colours(it, W, H):
-    """The pixel at each box centre shows the colour of the NEAREST box covering it (agents occlude each other)."""
+    """The pixel at each unoccluded box centre shows its class colour (boxes follow the warp)."""
     img = it["image"].permute(1, 2, 0).numpy()
-    boxes, cls, depth = it["boxes"].numpy(), it["cls"].numpy(), it["box3d"].numpy()[:, 0]
+    boxes, cls = it["boxes"].numpy(), it["cls"].numpy()
     xyxy = np.stack([(boxes[:, 0] - boxes[:, 2] / 2) * W, (boxes[:, 1] - boxes[:, 3] / 2) * H,
                      (boxes[:, 0] + boxes[:, 2] / 2) * W, (boxes[:, 1] + boxes[:, 3] / 2) * H], 1)
     eb = it["el_boxes"].numpy()
     exyxy = np.stack([(eb[:, 0] - eb[:, 2] / 2) * W, (eb[:, 1] - eb[:, 3] / 2) * H,
                       (eb[:, 0] + eb[:, 2] / 2) * W, (eb[:, 1] + eb[:, 3] / 2) * H], 1) if len(eb) else np.zeros((0, 4))
     for b in boxes:
-        cx, cy = int(b[0] * W), int(b[1] * H)
+        cx, cy = int(round(b[0] * W)), int(round(b[1] * H))
+        if b[2] * W < 12 or b[3] * H < 12:
+            continue  # tiny far boxes: bilinear blur and JPEG dominate the centre pixel
         if len(exyxy) and ((exyxy[:, 0] <= cx) & (cx <= exyxy[:, 2]) & (exyxy[:, 1] <= cy) & (cy <= exyxy[:, 3])).any():
             continue  # a sign / light (drawn last) covers the centre of a far agent
         cover = (xyxy[:, 0] <= cx) & (cx <= xyxy[:, 2]) & (xyxy[:, 1] <= cy) & (cy <= xyxy[:, 3])
-        nearest = int(np.argmin(np.where(cover, depth, np.inf)))
-        name = NAMES[int(cls[nearest])]
-        assert np.abs(img[cy, cx].astype(int) - AGENT_COLORS[name]).max() < 40, (name, img[cy, cx])
+        if cover.sum() != 1:
+            continue  # the centre lies inside another agent's box: an occlusion edge, ambiguous by construction
+        name = NAMES[int(cls[int(np.argmax(cover))])]
+        patch = img[max(cy - 1, 0):cy + 2, max(cx - 1, 0):cx + 2].reshape(-1, 3)
+        colour = np.median(patch, axis=0)
+        # JPEG chroma subsampling and the bilinear warp desaturate: the pixel must be closest to its own class
+        # colour among the scene palette (agent colours, road, ground, sky)
+        palette = {**AGENT_COLORS, "road": (85, 85, 88), "ground": (90, 140, 70), "sky": (150, 190, 240)}
+        nearest_name = min(palette, key=lambda k: np.abs(colour - palette[k]).sum())
+        assert nearest_name == name, (name, nearest_name, colour)
 
 @pytest.fixture(scope="module")
 def syn(tmp_path_factory):
@@ -167,3 +176,38 @@ def test_collate_shapes(syn, vocab):
     assert len(batch["boxes"]) == 3 and batch["cls_vocab"].shape == (3, 8) and batch["el_vocab"].shape == (3, 2)
     assert batch["label_mask"]["agents"].all() and batch["nominal"].all()
     assert batch["meta"][1]["index"] == 1
+
+
+def test_augmentation_changes_between_epochs(syn, vocab):
+    """The augmentation RNG must advance across epochs (a seed from torch.initial_seed() would repeat it)."""
+    aug = AugCfg(scale=(0.7, 1.3), translate=0.1, hflip=0.5, hsv_h=0, hsv_s=0, hsv_v=0)
+    ds = SparcDataset(syn, "train", vocab, augment=aug)
+    torch.manual_seed(0)
+    ks = [ds[0]["K"][0, 0].item() for _ in range(6)]
+    assert len(set(round(k, 3) for k in ks)) > 1
+    # anchors whose lateral offset exceeds the lane head's range are never visible
+    from sparc.data.dataset import Y_LIMIT
+    from sparc.nn.decoder import Y_RANGE
+
+    assert Y_LIMIT < Y_RANGE
+    for i in range(len(ds)):
+        it = ds[i]
+        if len(it["lane_y"]):
+            assert (it["lane_y"][it["lane_vis"]].abs() <= Y_LIMIT).all()
+
+
+def test_boxes_dropped_by_the_warp_leave_consistent_tables(syn, vocab):
+    """A strong translation pushes boxes out of the image: every per-box table must shrink together."""
+    aug = AugCfg(scale=(0.6, 0.8), translate=0.45, hflip=0.5, hsv_h=0, hsv_s=0, hsv_v=0)
+    ds = SparcDataset(syn, "train", vocab, augment=aug)
+    torch.manual_seed(3)
+    dropped = 0
+    for _ in range(4):
+        for i in range(len(ds)):
+            it, s = ds[i], ds.sample(i)
+            n, m = len(it["boxes"]), len(it["el_boxes"])
+            assert len(it["cls"]) == len(it["box3d"]) == len(it["track_id"]) == n
+            assert len(it["el_cls"]) == len(it["el_attr"]) == len(it["el_sign"]) == m
+            dropped += (len(s.boxes2d) - n) + (len(s.el_boxes) - m)
+            assert (it["boxes"][:, 2:] > 0).all() and (it["boxes"] >= -1e-6).all() and (it["boxes"] <= 1 + 1e-6).all()
+    assert dropped > 0  # the scenario really happened

@@ -3,9 +3,9 @@
 ``SparcNet.forward`` returns raw head outputs (training / evaluation in PyTorch). ``SparcDeploy`` wraps it with the
 engine I/O contract (``docs/sparc/plan.md`` section 5) and post-processing that belongs in the graph.
 
-Inputs (all float32): ``image`` (B, 3, H, W) RGB in [0, 1], letterboxed rectified left eye; ``K`` (B, 3, 3) at network
-pixels; ``cam2ego`` (B, 4, 4); and either ``depth`` (B, 1, H, W) metres (0 = invalid; any depth source) or, with
-``stereo=True``, ``image_right`` (B, 3, H, W) + ``baseline`` (B, 1) metres.
+Inputs (all float32): ``image`` (B, 3, H, W) RGB in [0, 1] in the virtual camera; ``K`` (B, 3, 3) at network
+pixels; ``cam2ego`` (B, 4, 4) (both condition the metric heads); and optionally ``depth`` (B, 1, H, W) metres
+(0 = invalid; any depth source) or, with ``stereo=True``, ``image_right`` (B, 3, H, W) + ``baseline`` (B, 1) metres.
 """
 
 from __future__ import annotations
@@ -68,7 +68,7 @@ class SparcNet(nn.Module):
         enc = self.encoder([feats["p3"], feats["p4"], feats["p5"]])
         if until == "encoder":
             return {"p2": feats["p2"], "e3": enc[0], "e4": enc[1], "e5": enc[2]}
-        out = self.decoder(enc)
+        out = self.decoder(enc, K, cam2ego, tuple(image.shape[-2:]))
         if until == "decoder":
             return out
         if self.training:
@@ -97,8 +97,9 @@ class SparcNet(nn.Module):
 
     def input_names(self, until: str = "full"):
         names = ["image"]
+        if until in ("decoder", "full"):
+            names += ["K", "cam2ego"]  # metric heads are conditioned on the camera
         if until == "full":
-            names += ["K", "cam2ego"] if (self.bev is not None or self.stereo is not None) else []
             if self.stereo is not None:
                 names += ["image_right", "baseline"]
             elif self.bev is not None and self.bev.splat is not None:

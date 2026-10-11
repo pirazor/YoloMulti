@@ -28,6 +28,7 @@ from sparc.data.schema import (ATTR_FLIP, DA_CLASSES, LANE_MASK_CLASSES, LANE_OR
                                LANE_X_ANCHORS, LabelMask, Sample, flip_cam2ego)
 from sparc.data.vocab import SignVocab
 
+Y_LIMIT = 38.0  # metres; must stay below sparc.nn.decoder.Y_RANGE
 MASK_KEYS = ("agents", "box3d", "track", "elements", "el_attr", "el_sign", "topology", "depth", "da", "lane_geom",
              "lane_3d", "lane_order", "lane_dir", "lane_cont", "lane_type", "lane_mask")
 N_ORDER = 2 * LANE_ORDER_RANGE
@@ -117,7 +118,9 @@ class SparcDataset(Dataset):
 
     def __getitem__(self, i: int) -> Dict:
         s = self.sample(i)
-        rng = random.Random((self.seed * 1_000_003 + i * 7919 + torch.initial_seed()) % (2 ** 31))
+        # the worker's (or main process's) torch RNG advances across epochs, also with persistent workers; a seed
+        # derived from torch.initial_seed() would give every item the same augmentation in every epoch
+        rng = random.Random(int(torch.randint(0, 2 ** 31 - 1, (1,)).item()) ^ (self.seed * 1_000_003 + i * 7919))
         H, W = self.camera.hw
         img = cv2.imread(str(self.sample_dir / s.image), cv2.IMREAD_COLOR)
         if img is None:
@@ -131,14 +134,14 @@ class SparcDataset(Dataset):
         lm = s.label_mask
         # road users
         boxes, keep = vc.warp_boxes(s.boxes2d, A, (H, W))
-        cls = s.cls[keep]
+        boxes, cls = boxes[keep], s.cls[keep]
         box3d = s.box3d[keep].copy()
         if flipped and len(box3d):
             box3d[:, 1] = -box3d[:, 1]   # yaw
             box3d[:, 6] = -box3d[:, 6]   # y_ego
         # elements
         el_boxes, ekeep = vc.warp_boxes(s.el_boxes, A, (H, W))
-        el_cls, el_attr = s.el_cls[ekeep], s.el_attr[ekeep].copy()
+        el_boxes, el_cls, el_attr = el_boxes[ekeep], s.el_cls[ekeep], s.el_attr[ekeep].copy()
         el_names = s.el_sign[ekeep].tolist()
         if flipped:
             el_attr = np.array([ATTR_FLIP.get(int(a), int(a)) for a in el_attr], dtype=np.int64).reshape(-1)
@@ -158,6 +161,7 @@ class SparcDataset(Dataset):
                 inside = (zc > 0.5) & np.isfinite(uv).all(1) & (uv[:, 0] > -0.1 * W) & (uv[:, 0] < 1.1 * W) & \
                          (uv[:, 1] > -0.1 * H) & (uv[:, 1] < 1.1 * H)
                 vis = vis & inside
+            vis = vis & (np.abs(np.nan_to_num(y)) <= Y_LIMIT)  # the lane head's lateral range
             if flipped:
                 y = -y
             lane_y[j], lane_z[j], lane_vis[j] = y, z, vis

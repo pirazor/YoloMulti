@@ -143,8 +143,10 @@ class Trainer:
         self.scaler = torch.amp.GradScaler(enabled=self.amp_dtype == torch.float16)
         self.ema = ModelEMA(self.model, cfg.ema)
         if self.distributed:
-            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=[self.device.index] if self.device.type == "cuda" else None,
-                                                             find_unused_parameters=True)
+            ids = [self.device.index] if self.device.type == "cuda" else None
+            self.model = nn.parallel.DistributedDataParallel(self.model, device_ids=ids, find_unused_parameters=True)
+            if self.distill is not None:  # the projector is trained too: its gradients must be all-reduced
+                self.distill.proj = nn.parallel.DistributedDataParallel(self.distill.proj, device_ids=ids)
         self.epoch, self.step, self.best = 0, 0, -1.0
         self.history: List[Dict[str, float]] = []
         if resume:
@@ -153,19 +155,17 @@ class Trainer:
     # ------------------------------------------------------------------ pieces
     def _optimizer(self):
         cfg = self.cfg
-        bb, rest, no_decay = [], [], []
+        groups_p = {("bb", True): [], ("bb", False): [], ("rest", True): [], ("rest", False): []}
         for name, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
-            if p.ndim <= 1 or name.endswith(".bias"):
-                no_decay.append(p)
-            elif name.startswith("backbone."):
-                bb.append(p)
-            else:
-                rest.append(p)
-        groups = [{"params": rest, "lr": cfg.lr, "weight_decay": cfg.weight_decay},
-                  {"params": bb, "lr": cfg.lr * cfg.backbone_lr_mult, "weight_decay": cfg.weight_decay},
-                  {"params": no_decay, "lr": cfg.lr, "weight_decay": 0.0}]
+            part = "bb" if name.startswith("backbone.") else "rest"
+            decay = not (p.ndim <= 1 or name.endswith(".bias"))
+            groups_p[(part, decay)].append(p)
+        groups = [{"params": groups_p[("rest", True)], "lr": cfg.lr, "weight_decay": cfg.weight_decay},
+                  {"params": groups_p[("rest", False)], "lr": cfg.lr, "weight_decay": 0.0},
+                  {"params": groups_p[("bb", True)], "lr": cfg.lr * cfg.backbone_lr_mult, "weight_decay": cfg.weight_decay},
+                  {"params": groups_p[("bb", False)], "lr": cfg.lr * cfg.backbone_lr_mult, "weight_decay": 0.0}]
         if self.distill is not None:
             groups.append({"params": list(self.distill.proj.parameters()), "lr": cfg.lr, "weight_decay": cfg.weight_decay})
         for g in groups:
@@ -292,7 +292,7 @@ class Trainer:
                  "epoch": self.epoch, "step": self.step, "best": self.best, "history": self.history,
                  "cfg": self.cfg.to_dict(), "data": self.data.to_dict(), "vocab": self.vocab.names, "aliases": self.vocab.aliases}
         if self.distill is not None:
-            state["distill_proj"] = self.distill.proj.state_dict()
+            state["distill_proj"] = _unwrap(self.distill.proj).state_dict()
         torch.save(state, path)
 
     def load(self, path: str | Path) -> None:
@@ -306,7 +306,7 @@ class Trainer:
         self.scheduler.load_state_dict(ck["scheduler"])
         self.scaler.load_state_dict(ck["scaler"])
         if self.distill is not None and "distill_proj" in ck:
-            self.distill.proj.load_state_dict(ck["distill_proj"])
+            _unwrap(self.distill.proj).load_state_dict(ck["distill_proj"])
         self.epoch, self.step, self.best, self.history = ck["epoch"], ck["step"], ck["best"], ck.get("history", [])
         LOG.info("resumed %s at epoch %d (step %d, best %.4f)", path, self.epoch, self.step, self.best)
 
@@ -315,6 +315,8 @@ def load_for_eval(weights: str | Path, device: str = "cpu", ema: bool = True):
     """(model, vocab, cfg) from a checkpoint, for validation / export."""
     ck = torch.load(weights, map_location=device, weights_only=False)
     cfg = TrainCfg.from_dict(ck["cfg"])
+    cfg.model.pretrained = False  # the checkpoint carries the weights
+    cfg.distill.enabled = False
     vocab = SignVocab(ck["vocab"], ck.get("aliases"))
     model = build_model(cfg, len(vocab))
     model.load_state_dict(ck["ema"] if ema else ck["model"])

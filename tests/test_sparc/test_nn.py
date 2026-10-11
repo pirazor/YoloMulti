@@ -222,3 +222,26 @@ def test_stage_cuts_and_input_names():
     with torch.no_grad():
         out = net(**mono, depth=torch.zeros(1, 1, 128, 192))
     assert "bev" in out and "disparity" not in out
+
+
+def test_camera_embedding_conditions_the_metric_heads():
+    """The same image under a different focal length / mount must give different lane offsets and 3D states."""
+    from sparc.nn.decoder import CameraEmbed
+
+    net = SparcNet(SparcCfg(backbone="yolo26s", imgsz=(128, 192), bev=False)).eval()
+    inp = example_inputs(net)
+    K2 = inp["K"].clone()
+    K2[:, 0, 0] *= 1.3
+    K2[:, 1, 1] *= 1.3
+    T2 = inp["cam2ego"].clone()
+    T2[:, 2, 3] += 0.4
+    with torch.no_grad():
+        a = net(inp["image"], K=inp["K"], cam2ego=inp["cam2ego"])
+        b = net(inp["image"], K=K2, cam2ego=inp["cam2ego"])
+        c = net(inp["image"], K=inp["K"], cam2ego=T2)
+    # (lane_y / lane_z start from a zeroed last layer, so test heads that are live at initialisation)
+    assert not torch.allclose(a["lane_vis_logits"], b["lane_vis_logits"]) and not torch.allclose(a["lane_vis_logits"], c["lane_vis_logits"])
+    assert not torch.allclose(a["box3d"], b["box3d"]) and not torch.allclose(a["box3d"], c["box3d"])
+    f = CameraEmbed.features(inp["K"], torch.tensor(ground_cam2ego(1.5, 0.1))[None].float(), (128, 192))[0]
+    assert f[4].item() == pytest.approx(0.75) and f[5].item() == pytest.approx(0.1, abs=1e-5) and abs(f[6].item()) < 1e-5
+    assert net.input_names("decoder") == ["image", "K", "cam2ego"] and net.input_names("full") == ["image", "K", "cam2ego"]

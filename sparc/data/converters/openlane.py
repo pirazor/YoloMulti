@@ -35,8 +35,9 @@ Confirmed against the repository documentation (fetched 2026-10):
 Ego frame of the sample: the Waymo-axes camera frame shifted down to the ground, ``ego = (x, y, z + h)`` with the
 camera height ``h = -median(z)`` of the visible lane points nearer than 15 m (lanes lie on the ground; all points
 when none is that near; ``extrinsic[2, 3]`` for a frame without lanes, counted). The ego frame is therefore
-camera-aligned (the camera pitch / roll of the extrinsic is not removed); ``cam2ego`` = OpenCV camera -> ego axes
-with translation ``(0, 0, h)``, so ``project_ego(points3d, K, cam2ego)`` reproduces ``uv``. ``K = intrinsic``,
+levelled: the camera pitch is estimated per frame from a plane fit through the lane points nearer than 40 m
+(``z = a + b x`` -> pitch = atan(b), height = -a) and removed, so the ego x axis is parallel to the road (roll is
+not removed); ``cam2ego = ground_cam2ego(h, pitch)``, so ``project_ego(points3d, K, cam2ego)`` reproduces ``uv``. ``K = intrinsic``,
 ``calib = "measured"``.
 
 Lanes: only points with ``visibility`` 1 are kept (dropped ones counted), a lane with < 2 visible points is skipped;
@@ -217,19 +218,31 @@ def _frame(anno: dict, hw: Tuple[int, int], lane_px: float, stats: ConvertStats,
             return None
         stats.skip("height from extrinsic (frame without lanes)")
         p_ego = []
+    # level the ego frame: fit z = a + b x through the lane points nearer than 40 m (the road is a plane there),
+    # pitch = atan(b) (> 0: the camera looks down), height = -a; rotate the points into the level frame
+    pitch = 0.0
+    if p_ego:
+        allp = np.concatenate(p_ego)
+        near = allp[allp[:, 0] < 40.0]
+        if len(near) >= 6 and np.ptp(near[:, 0]) > 5.0:
+            b, a = np.polyfit(near[:, 0], near[:, 2], 1)
+            if abs(b) < 0.2:  # < 11 deg; anything larger is not a camera pitch
+                pitch, h = float(np.arctan(b)), -float(a)
     if not h > 0:
         stats.skip_frame("camera height not positive")
         return None
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    R_level = np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])  # rotates the fitted plane onto z = 0
     lanes = []
     for (uv, _, cat, attr), pe in zip(raw, p_ego):
-        ego = pe + (0.0, 0.0, h)
+        ego = pe @ R_level.T + (0.0, 0.0, h)
         o = np.argsort(ego[:, 0], kind="stable")  # near first
         order, cont, ltype = lane_attrs(cat, attr, stats)
         lanes.append(LaneInstance(uv[o], ego[o], order=order, continuity=cont, ltype=ltype))
     mask = np.zeros(hw, np.uint8)
     draw_polylines(mask, [l.points for l in lanes], 1, line_thickness(hw, lane_px))
     lm = LabelMask(lane_geom=True, lane_3d=True, lane_order=True, lane_cont=True, lane_type=True, lane_mask=True)
-    return dict(label_mask=lm, lane_mask=mask, lanes=lanes, K=K, cam2ego=ground_cam2ego(h), calib="measured")
+    return dict(label_mask=lm, lane_mask=mask, lanes=lanes, K=K, cam2ego=ground_cam2ego(h, pitch), calib="measured")
 
 
 def _anno_root(args) -> Path:

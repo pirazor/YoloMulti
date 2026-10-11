@@ -65,6 +65,14 @@ def test_smoke_training_runs_resumes_and_evaluates(syn, tmp_path):
     data = DataCfg.load(_manifest(tmp_path, syn))
     tr = Trainer(cfg, data, out, device="cpu")
     assert len(tr.vocab) == 5 and tr.steps_per_epoch == 2
+    # backbone parameters (weights, biases and norms alike) run at lr * backbone_lr_mult
+    bb = {id(p) for n, p in tr.model.named_parameters() if n.startswith("backbone.")}
+    for g in tr.optimizer.param_groups:
+        in_bb = [id(p) in bb for p in g["params"]]
+        assert all(in_bb) or not any(in_bb)
+        if in_bb and all(in_bb):
+            assert g["initial_lr"] == pytest.approx(cfg.lr * cfg.backbone_lr_mult)  # g["lr"] is already warmup-scaled
+    assert sum(len(g["params"]) for g in tr.optimizer.param_groups) == sum(1 for p in tr.model.parameters() if p.requires_grad)
     last = tr.fit()
     assert tr.epoch == 2 and tr.step == 4
     assert (out / "weights" / "last.pt").exists() and (out / "weights" / "best.pt").exists() and (out / "signs.json").exists()

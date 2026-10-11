@@ -30,7 +30,7 @@ LOG = logging.getLogger("sparc.export")
 SPARC_TRT_OPS = frozenset(_ADAS_TRT_OPS | {
     "Abs", "And", "AveragePool", "BatchNormalization", "ConvTranspose", "Cos", "Erf", "GreaterOrEqual",
     "LayerNormalization", "LessOrEqual", "Log", "Max", "Min", "Not", "Or", "Range", "ReduceSum", "Sin",
-    "Gemm", "Einsum", "ReduceMin", "Sign", "Reciprocal", "Tanh", "HardSigmoid", "LeakyRelu", "PRelu",
+    "Gemm", "Einsum", "ReduceMin", "Sign", "Reciprocal", "Tanh", "HardSigmoid", "LeakyRelu", "PRelu", "Atan",
 })
 NEEDS_DEVICE_CHECK = frozenset({"GridSample", "ScatterElements", "DepthToSpace", "ScatterND"})
 

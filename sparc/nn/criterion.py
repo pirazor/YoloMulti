@@ -126,8 +126,8 @@ class Criterion(nn.Module):
         g = self.g
         use = batch["label_mask"][mask_key]
         quality = torch.zeros_like(logits)
-        valid = batch[vocab_key].to(logits.dtype)[:, None, :].expand(B, N, C).clone()
-        valid[~use] = 0.0
+        valid = batch[vocab_key].to(logits.device, logits.dtype)[:, None, :].expand(B, N, C).clone()
+        valid[~use.to(logits.device)] = 0.0
         matched_p, matched_g, l1, giou = [], [], [], []
         n_pos = 0
         for b in range(B):

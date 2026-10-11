@@ -13,14 +13,19 @@ encoder maps (one value projection, three query sets), one FFN. They differ in r
   ego frame) at the forward anchors, per-anchor visibility, existence, order relative to ego, travel direction,
   continuity, type. The image-space lane is the projection of these points (``sparc.data.geometry``).
 
-In training mode ``forward`` also returns every layer's outputs (``aux``) and the encoder's dense proposals
-(``enc_logits`` over the 10 agent + element classes, ``enc_box``) for the auxiliary losses.
+Metric outputs (lane offsets in metres, 3D depth / size) depend on the camera: a :class:`CameraEmbed` of the
+intrinsics and the mount (``K``, ``cam2ego``) is added to every query's positional embedding, so the same pixels
+under a different focal length, principal point, height or pitch map to the right metric targets (scale and
+translation augmentation change ``K``; height jitter and the mirrored camera change ``cam2ego``).
+
+In training mode ``forward`` also returns every layer's outputs (``aux``) and the encoder's top-k proposals
+(``enc_logits`` over the 10 agent + element classes, ``enc_box``; RT-DETR's query-selection loss).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -31,7 +36,7 @@ from sparc.nn.common import MLP, bias_init_with_prob, inverse_sigmoid, l2_normal
 from sparc.nn.deform_attn import MSDeformAttn
 
 N_ORDER = 2 * LANE_ORDER_RANGE  # -3..-1, 1..3
-Y_RANGE = 16.0                  # lateral range of the lane head (m), +-16 m = the BEV width
+Y_RANGE = 40.0                  # lateral range of the lane head (m): a 60 deg camera sees +-35 m at 60 m
 
 
 @dataclass
@@ -51,6 +56,29 @@ class DecoderCfg:
     n_sign: int = 1              # fine sign vocabulary size (set from the data manifest)
     id_dim: int = 64
     attn_mode: str = "grid_sample"
+
+
+class CameraEmbed(nn.Module):
+    """(K, cam2ego, image size) -> (B, d): normalised focal lengths / principal point, mount height, pitch, roll."""
+
+    def __init__(self, d: int):
+        super().__init__()
+        self.mlp = MLP(7, d, d, 2)
+
+    @staticmethod
+    def features(K: torch.Tensor, cam2ego: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
+        h, w = hw
+        fx, fy, cx, cy = K[:, 0, 0] / w, K[:, 1, 1] / h, K[:, 0, 2] / w - 0.5, K[:, 1, 2] / h - 0.5
+        R, t = cam2ego[:, :3, :3], cam2ego[:, :3, 3]
+        # atan (not atan2 / hypot: those have no ONNX symbolic); a forward camera has axis_x > 0
+        axis = R[:, :, 2]                                         # optical axis in the ego frame
+        pitch = torch.atan(-axis[:, 2] / axis[:, 0].clamp(min=1e-3))  # > 0 looks down
+        xaxis = R[:, :, 0]                                        # camera x in the ego frame (mirrored when flipped)
+        roll = torch.atan(xaxis[:, 2] / torch.sqrt(xaxis[:, 0] ** 2 + xaxis[:, 1] ** 2).clamp(min=1e-3))
+        return torch.stack([fx, fy, cx, cy, t[:, 2] / 2.0, pitch, roll], -1)
+
+    def forward(self, K: torch.Tensor, cam2ego: torch.Tensor, hw: Tuple[int, int]) -> torch.Tensor:
+        return self.mlp(self.features(K, cam2ego, hw).to(self.mlp.layers[0].weight.dtype))
 
 
 class DecoderLayer(nn.Module):
@@ -88,6 +116,7 @@ class TypedQueryDecoder(nn.Module):
         self.lane_content = nn.Embedding(c.n_lanes, c.d)
         self.lane_ref = nn.Embedding(c.n_lanes, 2)
         self.type_emb = nn.Embedding(3, c.d)
+        self.camera = CameraEmbed(c.d)
         self.pos_box = MLP(4, 2 * c.d, c.d, 2)
         self.pos_pt = MLP(2, 2 * c.d, c.d, 2)
         self.layers = nn.ModuleList(DecoderLayer(c, levels) for _ in range(c.layers))
@@ -145,7 +174,8 @@ class TypedQueryDecoder(nn.Module):
         box = self.enc_box(sel) + torch.gather(anchors, 1, topk[..., None].expand(-1, -1, 4))
         return sel.detach(), box.sigmoid().detach(), box, topk
 
-    def forward(self, feats: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def forward(self, feats: List[torch.Tensor], K: Optional[torch.Tensor] = None,
+                cam2ego: Optional[torch.Tensor] = None, hw: Optional[Tuple[int, int]] = None) -> Dict[str, torch.Tensor]:
         c = self.cfg
         shapes = [tuple(f.shape[-2:]) for f in feats]
         memory = torch.cat([f.flatten(2).transpose(1, 2) for f in feats], 1)  # (B, S, d)
@@ -160,6 +190,8 @@ class TypedQueryDecoder(nn.Module):
         x = torch.cat([x_agent, x_el, x_lane], 1)
         type_pos = torch.cat([self.type_emb.weight[0:1].expand(c.n_agents, -1), self.type_emb.weight[1:2].expand(c.n_elements, -1),
                               self.type_emb.weight[2:3].expand(c.n_lanes, -1)], 0)[None]
+        if K is not None and cam2ego is not None:
+            type_pos = type_pos + self.camera(K, cam2ego, hw or (shapes[0][0] * 8, shapes[0][1] * 8))[:, None, :]
         na, ne = c.n_agents, c.n_elements
         outs = []
         for i, layer in enumerate(self.layers):
@@ -179,8 +211,9 @@ class TypedQueryDecoder(nn.Module):
         out = outs[-1]
         if self.training:
             out["aux"] = outs[:-1]
-            out["enc_logits"] = enc_logits
-            out["enc_box"] = (self.enc_box(enc) + anchors).sigmoid()  # dense proposals for the selection loss
+            idx = torch.cat([topk_a, topk_e], 1)
+            out["enc_logits"] = torch.gather(enc_logits, 1, idx[..., None].expand(-1, -1, enc_logits.shape[-1]))
+            out["enc_box"] = torch.cat([box_a, box_e], 1).sigmoid()  # the selected proposals (query-selection loss)
             out["topk"] = (topk_a, topk_e)
         return out
 
