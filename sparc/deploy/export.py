@@ -30,7 +30,7 @@ LOG = logging.getLogger("sparc.export")
 SPARC_TRT_OPS = frozenset(_ADAS_TRT_OPS | {
     "Abs", "And", "AveragePool", "BatchNormalization", "ConvTranspose", "Cos", "Erf", "GreaterOrEqual",
     "LayerNormalization", "LessOrEqual", "Log", "Max", "Min", "Not", "Or", "Range", "ReduceSum", "Sin",
-    "Gemm", "Einsum", "ReduceMin", "Sign", "Reciprocal",
+    "Gemm", "Einsum", "ReduceMin", "Sign", "Reciprocal", "Tanh", "HardSigmoid", "LeakyRelu", "PRelu",
 })
 NEEDS_DEVICE_CHECK = frozenset({"GridSample", "ScatterElements", "DepthToSpace", "ScatterND"})
 
@@ -66,9 +66,11 @@ def scatter_reductions(path: str | Path) -> List[str]:
 # Column roles of the table outputs: "coord" (box edges, pixels: matched by IoU), "score", "id" (argmax ids: compared by
 # agreement), "p" (probabilities), "val" (regressed values). Agents are matched to the reference by box IoU before
 # the columns are compared (fp16 can reorder near-tied top-k entries); lanes keep their slot order.
-AGENT_ROLES = ("coord",) * 4 + ("score", "id", "val", "val", "val", "val", "val", "val", "val", "val", "id", "p", "id", "p")
+AGENT_ROLES = ("coord",) * 4 + ("score", "id") + ("val",) * 8
+ELEMENT_ROLES = ("coord",) * 4 + ("score", "id", "id", "p", "id", "p")
 LANE_META_ROLES = ("p", "id", "p", "id", "p", "id", "p", "id", "p")  # exist, order (value), p, dir, p, cont, p, type, p
-OUTPUT_POLICY = {"agents": "agents", "agent_emb": "rowset", "lane_meta": "lane_meta", "da": "label"}
+TABLE_ROLES = {"agents": AGENT_ROLES, "elements": ELEMENT_ROLES}
+OUTPUT_POLICY = {"agents": "agents", "elements": "elements", "agent_emb": "rowset", "lane_meta": "lane_meta", "da": "label"}
 
 
 def policy_for(name: str) -> str:
@@ -108,9 +110,9 @@ def compare(name: str, got: np.ndarray, ref: np.ndarray, policy: str) -> Dict[st
 
     * ``dense``: relative L2 error ``|got - ref| / |ref|`` and max abs error;
     * ``label``: fraction of equal elements (class maps);
-    * ``agents``: the reference's top-50 boxes (by score) are matched to output boxes by IoU > 0.9
+    * ``agents`` / ``elements``: the reference's top-50 boxes (by score) are matched to output boxes by IoU > 0.9
       (``top50_box_recall``); on the matched rows the id columns must agree and the probability / value / score
-      columns are compared numerically;
+      columns are compared numerically (roles in :data:`TABLE_ROLES`);
     * ``lane_meta``: per slot, id columns by agreement, probability columns by max abs error;
     * ``rowset``: per-agent vectors (ID embeddings): fraction of reference rows that have a row in the output within
       5 % relative L2 distance, whatever its position.
@@ -128,7 +130,7 @@ def compare(name: str, got: np.ndarray, ref: np.ndarray, policy: str) -> Dict[st
         return {"row_recall": float((d < 0.05).mean()), "row_rel_max": float(d.max())}
     if policy == "lane_meta":
         return _columns(got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1]), LANE_META_ROLES)
-    if policy == "agents":
+    if policy in TABLE_ROLES:
         g, r = got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1])
         top = np.argsort(-r[:, 4])[:50]
         iou = _iou_matrix(r[top, :4], g[:, :4])
@@ -136,7 +138,7 @@ def compare(name: str, got: np.ndarray, ref: np.ndarray, policy: str) -> Dict[st
         matched = iou[np.arange(len(top)), best] > 0.9
         out = {"top50_box_recall": float(matched.mean())}
         if matched.any():
-            out.update(_columns(g[best[matched]], r[top[matched]], AGENT_ROLES))
+            out.update(_columns(g[best[matched]], r[top[matched]], TABLE_ROLES[policy]))
         return out
     den = np.linalg.norm(ref) + 1e-12
     return {"rel_l2": float(np.linalg.norm(got - ref) / den), "max_abs": float(np.abs(got - ref).max())}

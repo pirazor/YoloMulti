@@ -1,0 +1,88 @@
+# Stage A: 2D perception on public datasets
+
+Stage A trains the SPARC network (backbone, encoder, typed-query decoder, drivable-area head) on public data only:
+road users (8 classes) and traffic elements (lights with colour, signs with a fine class) as query outputs, lanes as
+3D polylines in the ego frame with order / direction / continuity / type, and the drivable area. It is the first
+milestone that must beat the current `adas_mt` model on every output they share (`plan.md` section 4).
+
+## Pipeline
+
+```
+convert   python -m sparc convert bdd100k -- --root /data/bdd100k --dst data/sparc/bdd100k --limit 200   # read the summary, then without --limit
+          python -m sparc convert culane  -- --root /data/CULane   --dst data/sparc/culane
+          python -m sparc convert openlane -- --root /data/OpenLane --dst data/sparc/openlane
+          python -m sparc convert mtsd | tt100k | zod | dtld | bosch_tl | lisa_tl | nuimages -- --help
+train     python -m sparc train --cfg sparc/cfg/stage_a.yaml --data sparc/cfg/data_stage_a.yaml --out runs/sparc/stage_a
+          torchrun --nproc_per_node 4 -m sparc train ...                                           # DDP
+val       python -m sparc val --weights runs/sparc/stage_a/weights/best.pt --data sparc/cfg/data_stage_a.yaml --out runs/sparc/val
+smoke     python -m sparc synth -- --dst /tmp/syn --n-train 200 --n-val 40
+          python -m sparc train --cfg sparc/cfg/smoke.yaml --data <manifest listing /tmp/syn> --out runs/smoke --device cpu
+```
+
+Every converter writes the same sample format (`sparc/data/schema.py`): one `.npz` per frame, images linked, masks
+as PNGs, a `manifest.json` with counts, the sign names seen and every skipped record by reason. The converters are
+validated on format-faithful mini dumps (`tests/test_sparc/converters/`); on a real download run with `--limit`
+first and read the summary. `docs/sparc/plan.md` section 3 lists what each source supervises.
+
+## What happens to a sample at training time (`sparc/data/dataset.py`)
+
+1. The image is warped into the **virtual camera** (60 deg horizontal FOV at 384x640) with the scale / translation /
+   flip augmentation composed into the same affine map; `K` and `cam2ego` are transformed with it and fed to the
+   network. Sources without calibration use a nominal camera (`calib="nominal"`).
+2. Road-user and element boxes follow the warp; under a flip the light / sign attributes with a chirality are
+   mirrored (`turn_left` <-> `turn_right`, sign names with left/right) and the 3D state is mirrored.
+3. Lane polylines are lifted to the ego frame (flat-ground lift through the sample's camera; 3D sources use their
+   points directly) and resampled at 20 forward anchors (3-60 m): the lane head predicts lateral offset, height and
+   visibility per anchor. Under a flip `y -> -y` and the ego order changes sign.
+4. The drivable-area and lane-marking masks are packed into one uint8 map (`adas_mt.data.masks`) and warped with
+   nearest interpolation; the border is 255 (ignore), an unlabelled task unpacks to 255 everywhere.
+5. The sample's label mask and class vocabularies travel with it: the criterion computes each loss only where the
+   source labels it, and classification negatives only over the classes the source annotates (Null-BCE). The fine
+   sign loss is restricted to the vocabulary of the target's own dataset (names are prefixed `mtsd:`, `tt100k:`, ...).
+
+Sources are mixed by the manifest's weights (`WeightedSourceSampler`: every item of a source is seen once before any
+repeat; DDP ranks get disjoint slices).
+
+## Model, matching, losses
+
+* Decoder (`sparc/nn/decoder.py`): 200 agent + 50 element queries selected from the encoder tokens (RT-DETR query
+  selection over agents and elements separately), 24 learnt lane queries; three layers of shared self-attention +
+  deformable cross-attention; heads per query type.
+* Matching (`sparc/nn/criterion.py`): Hungarian per query type (agents / elements: focal class cost + L1 + GIoU;
+  lanes: L1 on the lateral offset at the ground-truth-visible anchors + existence). Classification uses DEIM's
+  matchability-aware loss with the matched IoU as the target quality. Lanes: L1 on `y` and `z` (`z` down-weighted
+  for nominal cameras), BCE on visibility and existence, CE on the attributes (weak labels x0.3). Dense: masked CE +
+  Dice (drivable area), masked CE + focal Tversky (lane-marking auxiliary mask). Auxiliary losses on every decoder
+  layer and on the encoder's dense proposals.
+* Distillation (`sparc/distill.py`): a frozen DINOv3 teacher on the encoder's stride-16 map, cosine-decayed weight
+  (off in `smoke.yaml`; needs the timm weights, i.e. Hugging Face access, on the training machine).
+
+## Metrics (`sparc/engine/evaluators.py`, per validation source, native image frame)
+
+| key | meaning |
+|---|---|
+| `<src>/agents_mAP50`, `agents_mAP50-95`, `AP50_<class>` | road users (predictions of classes the source does not label are ignored) |
+| `<src>/elements_mAP50(-95)` | lights + signs as boxes |
+| `<src>/bdd10_mAP50(-95)` | the 10-class BDD100K benchmark (agents + elements), on sources that label both |
+| `<src>/light_color_acc`, `sign_top1`, `el_recall50` | attribute / fine class of elements matched to GT by IoU >= 0.5 |
+| `<src>/da_mIoU`, `da_IoU_fg`, `da_IoU_<class>` | drivable area in the network frame (padding ignored) |
+| `<src>/lane_F1`, `lane_P`, `lane_R`, `lane_order_acc`, `lane_dir_acc` | CULane protocol (30 px at 1640 px width, IoU >= 0.5) on the projected 3D lanes; attributes on matched, non-weak lanes |
+| `fitness` | weighted mean of the `fitness:` keys of the config, each averaged over the sources that report it; selects `best.pt` |
+
+`results.csv` holds one row per epoch with every key; `run.yaml` the effective configuration; `signs.json` the
+sign vocabulary the checkpoint was trained with (needed to evaluate it on other manifests).
+
+## Acceptance (plan.md, stage A) and what is still open
+
+Acceptance: BDD100K detection mAP >= DEIMv2-S fine-tuned on BDD100K - 0.5 while also producing drivable area and
+lanes; DA mIoU >= 92; CULane F1 >= 79; MTSD top-1 >= the current `sign_classifier`. Those numbers come from the
+GPU run; nothing here is trained yet.
+
+Verified on the CPU (`tests/test_sparc`): the geometry of the warp / lift / flip, the converters on mini dumps, the
+criterion on perfect predictions (near-zero loss) and its gating / vocabulary masking, a training run end to end
+(loop, validation, checkpoint, resume, CLI) and, opt-in (`ADAS_SLOW_TESTS=1`), that the smoke model learns the
+synthetic scenes.
+
+Not in stage A yet (planned stages): D-FINE box distributions and denoising queries (recipe refinements), mosaic
+for 2D-only samples, the lane rule fallback for BDD100K direction labels, the topology head, depth / BEV / temporal
+parts (stages B-C), the Colab notebook for stage A.

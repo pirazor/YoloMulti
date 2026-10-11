@@ -3,7 +3,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sparc.data.schema import (CLS_TRAFFIC_LIGHT, DET_CLASSES, LabelMask, LaneInstance, Sample, ground_cam2ego)
+from sparc.data.schema import (AGENT_CLASSES, ATTR_FLIP, BDD_CLASSES, EL_LIGHT, EL_SIGN, ELEMENT_ATTRS, LabelMask,
+                               LaneInstance, Sample, flip_cam2ego, ground_cam2ego)
 from sparc.rig.stereo import StereoRig
 
 CALIB = Path(__file__).parent / "data" / "stereo_calib_example.yaml"
@@ -12,9 +13,12 @@ K = np.array([[1000.0, 0, 640], [0, 1000, 360], [0, 0, 1]])
 
 def _sample(**kw):
     base = dict(image="img/a.jpg", hw=(720, 1280), K=K, cam2ego=ground_cam2ego(1.4, 0.02), source="bdd100k",
-                licence="research", label_mask=LabelMask(det=True, tl=True, cls_vocab=range(10), lane_geom=True,
-                                                         lane_dir=True, da=True, lane_mask=True),
-                boxes2d=[[10, 20, 50, 80], [600, 100, 620, 140]], cls=[2, CLS_TRAFFIC_LIGHT], tl_color=[-1, 1],
+                licence="research", calib="nominal",
+                label_mask=LabelMask(agents=True, cls_vocab=range(8), elements=True, el_vocab=(0, 1), el_attr=True,
+                                     lane_geom=True, lane_dir=True, da=True, lane_mask=True),
+                boxes2d=[[10, 20, 50, 80]], cls=[2],
+                el_boxes=[[600, 100, 620, 140], [700, 90, 730, 120]], el_cls=[EL_LIGHT, EL_SIGN], el_attr=[1, -1],
+                el_sign=["", "regulatory--stop--g1"],
                 lanes=[LaneInstance([[100, 700], [400, 400]], order=-1, direction=1, continuity=0, ltype=1, weak=True)],
                 da_mask="da/a.png", lane_mask="ll/a.png", clip_id="c1", frame_idx=3, timestamp_ns=123)
     base.update(kw)
@@ -22,20 +26,27 @@ def _sample(**kw):
 
 
 def test_sample_round_trip(tmp_path):
-    s = _sample(box3d=[[12.0, 0.1, 4.5, 1.8, 1.5, 12.3, -1.0], [np.nan] * 7], track_id=[5, -1],
+    s = _sample(box3d=[[12.0, 0.1, 4.5, 1.8, 1.5, 12.3, -1.0]], track_id=[5],
                 world_from_ego=np.eye(4), image_right="img/a_r.jpg", baseline_m=0.0998, depth="d/a.png",
-                depth_source="stereo", label_mask=LabelMask(det=True, cls_vocab=range(10), box3d=True, depth=True,
-                                                            track=True, tl=True))
+                depth_source="stereo", el_lane=[0, -1],
+                lanes=[LaneInstance([[100, 700], [400, 400]], points3d=[[3, 1.7, 0], [30, 1.6, 0.1]], order=-1,
+                                    direction=1, continuity=0, ltype=1, weak=True),
+                       LaneInstance([[800, 700], [500, 400]], order=1)],
+                label_mask=LabelMask(agents=True, cls_vocab=range(8), box3d=True, depth=True, track=True, elements=True,
+                                     el_vocab=(0, 1), el_attr=True, el_sign=True, topology=True, lane_geom=True,
+                                     lane_3d=False, da=True, lane_mask=True))
     p = s.save(tmp_path / "s" / "a")
     t = Sample.load(p)
-    for k in ("image", "hw", "source", "licence", "image_right", "baseline_m", "depth", "depth_source", "clip_id",
+    for k in ("image", "hw", "source", "licence", "calib", "image_right", "baseline_m", "depth", "depth_source", "clip_id",
               "frame_idx", "timestamp_ns", "label_mask"):
         assert getattr(t, k) == getattr(s, k), k
-    for k in ("K", "cam2ego", "boxes2d", "cls", "tl_color", "sign_cls", "track_id", "world_from_ego"):
+    for k in ("K", "cam2ego", "boxes2d", "cls", "track_id", "world_from_ego", "el_boxes", "el_cls", "el_attr", "el_lane"):
         np.testing.assert_array_equal(getattr(t, k), getattr(s, k))
+    assert t.el_sign.tolist() == ["", "regulatory--stop--g1"]
     np.testing.assert_array_equal(np.isnan(t.box3d), np.isnan(s.box3d))
-    assert len(t.lanes) == 1 and t.lanes[0].weak and t.lanes[0].order == -1
+    assert len(t.lanes) == 2 and t.lanes[0].weak and t.lanes[0].order == -1 and t.lanes[1].points3d is None
     np.testing.assert_array_equal(t.lanes[0].points, s.lanes[0].points)
+    np.testing.assert_array_equal(t.lanes[0].points3d, s.lanes[0].points3d)
 
 
 def test_sample_without_optional_parts_round_trips(tmp_path):
@@ -43,20 +54,24 @@ def test_sample_without_optional_parts_round_trips(tmp_path):
                label_mask=LabelMask(lane_geom=True, lane_order=True),
                lanes=[LaneInstance([[1, 2], [3, 4], [5, 6]], order=1)])
     t = Sample.load(s.save(tmp_path / "x"))
-    assert len(t.boxes2d) == 0 and t.box3d.shape == (0, 7) and t.lanes[0].order == 1
+    assert len(t.boxes2d) == 0 and t.box3d.shape == (0, 7) and len(t.el_boxes) == 0 and t.el_sign.shape == (0,)
+    assert t.lanes[0].order == 1
 
 
 @pytest.mark.parametrize("kw, msg", [
-    (dict(cls=[2, 3]), "not a traffic light"),
-    (dict(boxes2d=[[10, 20, 5, 80], [600, 100, 620, 140]]), "x2 > x1"),
-    (dict(cls=[2, 11]), "cls ids"),
+    (dict(boxes2d=[[10, 20, 5, 80]]), "x2 > x1"),
+    (dict(cls=[11]), "cls ids"),
+    (dict(el_sign=["x", ""]), "not a traffic sign"),
+    (dict(el_attr=[13, -1]), "el_attr id"),
+    (dict(el_lane=[0, 3]), "el_lane"),
     (dict(da_mask=None), "da file is missing"),
     (dict(licence="cc"), "licence"),
+    (dict(calib="guess"), "calib"),
     (dict(image_right="r.jpg"), "image_right and baseline_m"),
-    (dict(label_mask=LabelMask(det=True, cls_vocab=[9])), "cls_vocab"),
-    (dict(label_mask=LabelMask(lane_geom=False, lane_type=True)), "lane attributes need lane_geom"),
-    (dict(label_mask=LabelMask(tl=True)), "need det"),
-    (dict(box3d=[[12.0, 0.1, 4.5, 1.8, 1.5, np.nan, -1.0], [np.nan] * 7]), "all finite"),
+    (dict(label_mask=LabelMask(agents=True, cls_vocab=[7])), "cls_vocab"),
+    (dict(label_mask=LabelMask(elements=True, el_vocab=[1])), "el_vocab"),
+    (dict(label_mask=LabelMask(agents=True, cls_vocab=range(8), lane_geom=True, lane_3d=True)), "no points3d"),
+    (dict(box3d=[[12.0, 0.1, 4.5, 1.8, 1.5, np.nan, -1.0]]), "all finite"),
 ])
 def test_sample_validation(kw, msg):
     with pytest.raises(ValueError, match=msg):
@@ -65,11 +80,19 @@ def test_sample_validation(kw, msg):
 
 def test_label_mask_rules():
     with pytest.raises(ValueError, match="cls_vocab"):
-        LabelMask(det=True)
-    assert LabelMask(det=True, cls_vocab=[9]).vocab_mask().tolist() == [False] * 9 + [True]
+        LabelMask(agents=True)
+    with pytest.raises(ValueError, match="need agents"):
+        LabelMask(track=True)
+    with pytest.raises(ValueError, match="need lane_geom"):
+        LabelMask(lane_geom=False, lane_type=True)
+    with pytest.raises(ValueError, match="need elements"):
+        LabelMask(el_attr=True)
+    assert LabelMask(agents=True, cls_vocab=[7]).vocab_mask().tolist() == [False] * 7 + [True]
+    assert LabelMask(elements=True, el_vocab=[1]).el_vocab_mask().tolist() == [False, True]
     with pytest.raises(ValueError, match="order"):
         LaneInstance([[0, 0], [1, 1]], order=0)
-    assert len(DET_CLASSES) == 10
+    assert len(AGENT_CLASSES) == 8 and len(BDD_CLASSES) == 10 and len(ELEMENT_ATTRS) == 13
+    assert ATTR_FLIP[ELEMENT_ATTRS.index("turn_left")] == ELEMENT_ATTRS.index("turn_right")
 
 
 def test_ground_cam2ego_axes():
@@ -82,6 +105,11 @@ def test_ground_cam2ego_axes():
     T0 = ground_cam2ego(1.5)
     p_cam = np.linalg.inv(T0) @ np.array([10.0, 0, 0, 1])
     assert p_cam[2] == pytest.approx(10.0) and p_cam[1] == pytest.approx(1.5)
+    # mirrored scene: a point 2 m left of the camera (ego y = +2) becomes 2 m right, and stays in front
+    Tf = flip_cam2ego(T)
+    p = np.linalg.inv(T) @ np.array([10.0, 2.0, 0.0, 1.0])     # camera coordinates of the point
+    pf = Tf @ np.array([-p[0], p[1], p[2], 1.0])               # same pixel column mirrored -> camera x negated
+    assert pf[0] == pytest.approx(10.0) and pf[1] == pytest.approx(-2.0) and pf[2] == pytest.approx(0.0, abs=1e-9)
 
 
 def test_example_rig_geometry():

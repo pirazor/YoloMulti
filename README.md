@@ -23,13 +23,17 @@ One temporal sparse-query network for a front camera + IMU + GNSS on a Jetson Or
 tracking, traffic-light colour and fine sign class, lanes with ego order and travel direction, drivable area, a BEV
 map and light-to-lane topology. Depth is an auxiliary signal (optional input, training target), never a dependency;
 training starts on public datasets ([design and plan](docs/sparc/plan.md)). Phase 0
-([report](docs/sparc/phase0.md)) measures the backbone candidates and the TensorRT-critical ops on the device:
+([report](docs/sparc/phase0.md)) measures the backbone candidates and the TensorRT-critical ops on the device;
+stage A ([guide](docs/sparc/stage_a.md)) converts the public datasets and trains the 2D model:
 
 ```bash
 python -m sparc rig --calib stereo_calib.yaml --baseline 0.10   # FOV, network intrinsics, depth precision vs range
 python -m sparc profile --stereo                                # params / GFLOPs per component and candidate
 python -m sparc bakeoff export --out runs/bakeoff               # then on the Jetson: python3 runs/bakeoff/run_on_device.py
 python -m sparc bakeoff report --out runs/bakeoff
+python -m sparc convert bdd100k -- --root /data/bdd100k --dst data/sparc/bdd100k   # and culane, openlane, mtsd, zod, ...
+python -m sparc train --cfg sparc/cfg/stage_a.yaml --data sparc/cfg/data_stage_a.yaml --out runs/sparc/stage_a
+python -m sparc val --weights runs/sparc/stage_a/weights/best.pt --data sparc/cfg/data_stage_a.yaml --out runs/sparc/val
 ```
 
 ## Train on Google Colab

@@ -121,7 +121,7 @@ def test_runner_and_library_compare_agree():
     from sparc.deploy.export import compare
 
     rng = np.random.default_rng(0)
-    ref = rng.random((1, 200, 18)).astype(np.float32)
+    ref = rng.random((1, 200, 14)).astype(np.float32)
     ref[..., 2:4] += ref[..., 0:2] + 0.5
     got = ref + rng.normal(0, 1e-3, ref.shape)
     emb = rng.normal(size=(1, 200, 64))
@@ -135,15 +135,19 @@ def test_runner_and_library_compare_agree():
     assert dev.compare(lab, lab, "label") == compare("da", lab, lab, "label") == {"agree": 1.0}
     from sparc.deploy.export import PARITY_LIMITS_FP16
 
-    assert tuple(dev.LIMITS) == tuple(PARITY_LIMITS_FP16) and dev.AGENT_ROLES == export_mod.AGENT_ROLES
+    assert tuple(dev.LIMITS) == tuple(PARITY_LIMITS_FP16) and dev.TABLE_ROLES == export_mod.TABLE_ROLES
     assert parity_ok({"x": {"rel_l2": 0.01}}) and not parity_ok({"x": {"rel_l2": 0.5}})
     # agents: a reordered, fp16-noisy table with one flipped sign id is still matched row by row
-    ag = rng.random((1, 200, 18)); ag[..., 2:4] += ag[..., 0:2] + 0.5
-    ag[..., 5] = rng.integers(0, 10, (1, 200)); ag[..., 14] = rng.integers(0, 4, (1, 200)); ag[..., 16] = rng.integers(0, 401, (1, 200))
+    ag = rng.random((1, 200, 14)); ag[..., 2:4] += ag[..., 0:2] + 0.5
+    ag[..., 5] = rng.integers(0, 8, (1, 200))
     p2 = ag[:, rng.permutation(200)].copy()
-    p2[0, 0, 16] += 1  # one wrong sign id among the top-50 rows (or not; depends on where row 0 ranks)
     m = compare("agents", p2, ag, "agents")
-    assert m == dev.compare(p2, ag, "agents") and m["top50_box_recall"] == 1.0 and m["val_rel_l2"] == 0.0 and m["id_agree"] >= 0.99
+    assert m == dev.compare(p2, ag, "agents") and m["top50_box_recall"] == 1.0 and m["val_rel_l2"] == 0.0 and m["id_agree"] == 1.0
+    el = rng.random((1, 50, 10)); el[..., 2:4] += el[..., 0:2] + 0.5
+    el[..., 5] = rng.integers(0, 2, (1, 50)); el[..., 6] = rng.integers(0, 13, (1, 50)); el[..., 8] = rng.integers(0, 300, (1, 50))
+    e2 = el.copy(); e2[0, int(np.argmax(el[0, :, 4])), 8] += 1  # the top-scoring element gets a wrong sign id
+    m = compare("elements", e2, el, "elements")
+    assert m == dev.compare(e2, el, "elements") and m["top50_box_recall"] == 1.0 and m["id_agree"] < 1.0 and m["p_max_abs"] == 0.0
     lm = rng.random((1, 24, 9)); lm[..., [1, 3, 5, 7]] = rng.integers(0, 3, (1, 24, 4))
     lm2 = lm.copy(); lm2[0, 0, 7] += 1
     m = compare("lane_meta", lm2, lm, "lane_meta")

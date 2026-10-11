@@ -1,0 +1,19 @@
+# Stage A data manifest: converted sources (python -m sparc convert <source> ...) with sampler weights.
+# Paths are relative to this file unless absolute.
+train:
+  - {root: ../../data/sparc/bdd100k, weight: 0.35}
+  - {root: ../../data/sparc/zod, weight: 0.20}
+  - {root: ../../data/sparc/openlane, weight: 0.15}
+  - {root: ../../data/sparc/culane, weight: 0.10}
+  - {root: ../../data/sparc/mtsd, weight: 0.06}
+  - {root: ../../data/sparc/tt100k, weight: 0.04}
+  - {root: ../../data/sparc/dtld, weight: 0.02}
+  - {root: ../../data/sparc/bosch_tl, weight: 0.02}
+  - {root: ../../data/sparc/lisa_tl, weight: 0.01}
+  - {root: ../../data/sparc/nuimages, weight: 0.05}
+val:
+  - {root: ../../data/sparc/bdd100k}
+  - {root: ../../data/sparc/culane}
+  - {root: ../../data/sparc/openlane}
+  - {root: ../../data/sparc/mtsd}
+  - {root: ../../data/sparc/zod}

@@ -1,4 +1,4 @@
-<!-- Status: v2 design, 2026-10-11. Replaces plan_v1_superseded.md after review: depth must not be load-bearing, training
+<!-- Status: v2 design, 2026-10-11. Stage A code implemented (docs/sparc/stage_a.md: converters, virtual camera, dataset, decoder heads, criterion, trainer, evaluators; CPU-verified, untrained); Phase 0 bake-off pending on the device. Replaces plan_v1_superseded.md. -->
 starts on public datasets before any own recordings, and the novelty claims are stated honestly. Phase 0 (docs/sparc/phase0.md)
 remains valid: the bake-off tooling, rig geometry and schema are reused; the stereo head becomes an optional ablation. -->
 

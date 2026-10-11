@@ -60,8 +60,10 @@ def device_info() -> dict:
 
 # ------------------------------------------------------------------ comparison (mirrors sparc.deploy.export)
 # Keep identical to sparc/deploy/export.py (tests/test_sparc/test_bakeoff.py checks both agree).
-AGENT_ROLES = ("coord",) * 4 + ("score", "id", "val", "val", "val", "val", "val", "val", "val", "val", "id", "p", "id", "p")
+AGENT_ROLES = ("coord",) * 4 + ("score", "id") + ("val",) * 8
+ELEMENT_ROLES = ("coord",) * 4 + ("score", "id", "id", "p", "id", "p")
 LANE_META_ROLES = ("p", "id", "p", "id", "p", "id", "p", "id", "p")
+TABLE_ROLES = {"agents": AGENT_ROLES, "elements": ELEMENT_ROLES}
 LIMITS = (("rel_l2", 0.05, "max"), ("agree", 0.97, "min"), ("top50_box_recall", 0.8, "min"),
           ("row_recall", 0.8, "min"), ("id_agree", 0.9, "min"), ("p_max_abs", 0.1, "max"),
           ("score_max_abs", 0.05, "max"), ("val_rel_l2", 0.05, "max"))
@@ -107,7 +109,7 @@ def compare(got, ref, policy):
         return {"row_recall": float((d < 0.05).mean()), "row_rel_max": float(d.max())}
     if policy == "lane_meta":
         return _columns(got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1]), LANE_META_ROLES)
-    if policy == "agents":
+    if policy in TABLE_ROLES:
         g, r = got.reshape(-1, got.shape[-1]), ref.reshape(-1, ref.shape[-1])
         top = np.argsort(-r[:, 4])[:50]
         iou = _iou_matrix(r[top, :4], g[:, :4])
@@ -115,7 +117,7 @@ def compare(got, ref, policy):
         matched = iou[np.arange(len(top)), best] > 0.9
         out = {"top50_box_recall": float(matched.mean())}
         if matched.any():
-            out.update(_columns(g[best[matched]], r[top[matched]], AGENT_ROLES))
+            out.update(_columns(g[best[matched]], r[top[matched]], TABLE_ROLES[policy]))
         return out
     return {"rel_l2": float(np.linalg.norm(got - ref) / (np.linalg.norm(ref) + 1e-12)), "max_abs": float(np.abs(got - ref).max())}
 

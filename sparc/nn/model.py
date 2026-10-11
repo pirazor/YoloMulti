@@ -16,7 +16,7 @@ from typing import Dict, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from sparc.data.schema import DA_CLASSES, LANE_ORDER_RANGE
+from sparc.data.schema import DA_CLASSES, LANE_ORDER_RANGE, LANE_X_ANCHORS
 from sparc.nn.backbone import build_backbone
 from sparc.nn.bev import BEVGrid, BEVHead
 from sparc.nn.common import Normalize, l2_normalize
@@ -71,6 +71,8 @@ class SparcNet(nn.Module):
         out = self.decoder(enc)
         if until == "decoder":
             return out
+        if self.training:
+            out["enc_feats"] = enc  # for the distillation hook (stride 8 / 16 / 32)
         out["da_logits"] = self.da_head(feats["p2"], enc[0])
         if self.lane_aux is not None and self.training:
             out["lane_mask_logits"] = self.lane_aux(feats["p2"], enc[0])
@@ -106,7 +108,9 @@ class SparcNet(nn.Module):
 
 ORDER_VALUES = [o for o in range(-LANE_ORDER_RANGE, LANE_ORDER_RANGE + 1) if o != 0]
 AGENT_COLUMNS = ("x1", "y1", "x2", "y2", "score", "cls", "depth", "yaw_sin", "yaw_cos", "length", "width", "height",
-                 "x_ego", "y_ego", "tl_id", "tl_p", "sign_id", "sign_p")
+                 "x_ego", "y_ego")
+ELEMENT_COLUMNS = ("x1", "y1", "x2", "y2", "score", "cls", "attr_id", "attr_p", "sign_id", "sign_p")
+LANE_META_COLUMNS = ("exist", "order", "order_p", "dir_id", "dir_p", "cont_id", "cont_p", "type_id", "type_p")
 
 
 def _top1(logits: torch.Tensor):
@@ -115,21 +119,33 @@ def _top1(logits: torch.Tensor):
     return i.to(logits.dtype), v
 
 
+def _xyxy(cxcywh_norm: torch.Tensor, w: int, h: int) -> torch.Tensor:
+    scale = torch.tensor([w, h, w, h], dtype=cxcywh_norm.dtype, device=cxcywh_norm.device)
+    b = cxcywh_norm * scale
+    return torch.cat([b[..., :2] - b[..., 2:] / 2, b[..., :2] + b[..., 2:] / 2], -1), b
+
+
 class SparcDeploy(nn.Module):
-    """Engine I/O contract around :class:`SparcNet` (positional inputs in ``input_names`` order)."""
+    """Engine I/O contract around :class:`SparcNet` (positional inputs in ``input_names`` order).
+
+    Outputs: ``agents`` (B, N, 14) = :data:`AGENT_COLUMNS` (pixels of the network input, ego metres),
+    ``agent_emb`` (B, N, 64), ``elements`` (B, M, 10) = :data:`ELEMENT_COLUMNS`, ``lane_pts`` (B, L, A, 2) = lateral
+    offset y and height z (m) at :data:`LANE_X_ANCHORS`, ``lane_vis`` (B, L, A) probabilities, ``lane_meta``
+    (B, L, 9) = :data:`LANE_META_COLUMNS`, ``da`` (B, H, W) int32 class map, then ``depth`` / ``bev`` when present."""
 
     def __init__(self, net: SparcNet, until: str = "full"):
         super().__init__()
         self.net, self.until = net.eval(), until
         self.inputs = net.input_names(until)
         self.register_buffer("order_values", torch.tensor(ORDER_VALUES, dtype=torch.float32), persistent=False)
+        self.register_buffer("lane_x", torch.tensor(LANE_X_ANCHORS, dtype=torch.float32), persistent=False)
 
     def output_names(self):
         if self.until == "backbone":
             return ["p2", "p3", "p4", "p5"]
         if self.until == "encoder":
             return ["p2", "e3", "e4", "e5"]
-        names = ["agents", "agent_emb", "lane_xs", "lane_vis", "lane_meta"]
+        names = ["agents", "agent_emb", "elements", "lane_pts", "lane_vis", "lane_meta"]
         if self.until == "full":
             names.append("da")
             if self.net.stereo is not None:
@@ -145,9 +161,7 @@ class SparcDeploy(nn.Module):
             return tuple(out[k] for k in self.output_names())
         image = kw["image"]
         h, w = image.shape[-2:]
-        scale = torch.tensor([w, h, w, h], dtype=image.dtype, device=image.device)
-        cxcywh = out["boxes"] * scale
-        xyxy = torch.cat([cxcywh[..., :2] - cxcywh[..., 2:] / 2, cxcywh[..., :2] + cxcywh[..., 2:] / 2], -1)
+        xyxy, cxcywh = _xyxy(out["boxes"], w, h)
         score, cls = out["logits"].sigmoid().max(-1)
         b3 = out["box3d"]
         depth = b3[..., 0].exp()
@@ -163,19 +177,22 @@ class SparcDeploy(nn.Module):
             x_ego, y_ego = e[:, 0], e[:, 1]
         else:
             x_ego = y_ego = torch.zeros_like(depth)
-        tl_id, tl_p = _top1(out["tl_logits"])
-        sign_id, sign_p = _top1(out["sign_logits"])
         agents = torch.cat([xyxy, score[..., None], cls[..., None].to(image.dtype), depth[..., None], yaw, lwh,
-                            x_ego[..., None], y_ego[..., None], tl_id[..., None], tl_p[..., None],
-                            sign_id[..., None], sign_p[..., None]], -1)
-        lane_xs = out["lane_x"] * w
+                            x_ego[..., None], y_ego[..., None]], -1)
+        el_xyxy, _ = _xyxy(out["el_boxes"], w, h)
+        el_score, el_cls = out["el_logits"].sigmoid().max(-1)
+        attr_id, attr_p = _top1(out["el_attr_logits"])
+        sign_id, sign_p = _top1(out["el_sign_logits"])
+        elements = torch.cat([el_xyxy, el_score[..., None], el_cls[..., None].to(image.dtype), attr_id[..., None],
+                              attr_p[..., None], sign_id[..., None], sign_p[..., None]], -1)
+        lane_pts = torch.stack([out["lane_y"], out["lane_z"]], -1)
         lane_vis = out["lane_vis_logits"].sigmoid()
         o_id, o_p = _top1(out["lane_order_logits"])
         o_val = torch.gather(self.order_values.expand(o_id.shape[0], -1), 1, o_id.long())
         metas = [out["lane_exist_logits"].sigmoid(), o_val, o_p]
         for k in ("lane_dir_logits", "lane_cont_logits", "lane_type_logits"):
             metas += list(_top1(out[k]))
-        res = [agents, out["id_emb"], lane_xs, lane_vis, torch.stack(metas, -1)]
+        res = [agents, out["id_emb"], elements, lane_pts, lane_vis, torch.stack(metas, -1)]
         if self.until == "full":
             res.append(out["da_logits"].argmax(1).to(torch.int32))
             if self.net.stereo is not None:

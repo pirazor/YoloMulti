@@ -23,6 +23,58 @@ def cmd_rig(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_convert(a: argparse.Namespace) -> int:
+    from sparc.data import converters
+
+    mod = converters.get(a.source)
+    sub = argparse.ArgumentParser(prog=f"python -m sparc convert {a.source}", description=mod.__doc__,
+                                  formatter_class=argparse.RawDescriptionHelpFormatter)
+    mod.add_args(sub)
+    stats = mod.convert(sub.parse_args(a.rest))
+    print(stats.summary())
+    return 0
+
+
+def cmd_train(a: argparse.Namespace) -> int:
+    from sparc.engine.config import DataCfg, TrainCfg
+    from sparc.engine.trainer import Trainer
+
+    overrides = {"epochs": a.epochs, "batch": a.batch, "workers": a.workers, "lr": a.lr, "epoch_size": a.epoch_size,
+                 "amp": a.amp, "model.backbone": a.backbone, "model.pretrained": a.pretrained, "distill.enabled": a.distill}
+    cfg = TrainCfg.load(a.cfg, overrides)
+    data = DataCfg.load(a.data)
+    if a.signs:
+        data.signs = a.signs
+    tr = Trainer(cfg, data, a.out, device=a.device, resume=a.resume)
+    last = tr.fit()
+    if tr.main:
+        print(json.dumps({k: v for k, v in last.items() if isinstance(v, (int, float))}, indent=1))
+    return 0
+
+
+def cmd_val(a: argparse.Namespace) -> int:
+    from sparc.engine.config import DataCfg
+    from sparc.engine.trainer import Trainer, load_for_eval
+
+    model, vocab, cfg = load_for_eval(a.weights, a.device or ("cuda:0" if __import__("torch").cuda.is_available() else "cpu"))
+    data = DataCfg.load(a.data)
+    data.signs = a.signs or str(Path(a.weights).resolve().parent.parent / "signs.json")
+    if not Path(data.signs).exists():
+        data.signs = None
+    cfg.workers = a.workers if a.workers is not None else cfg.workers
+    tr = Trainer(cfg, DataCfg(train=data.val, val=data.val, signs=data.signs), a.out, device=a.device)
+    res = tr.validate(model)
+    print(json.dumps(res, indent=1))
+    (Path(a.out) / "val.json").write_text(json.dumps(res, indent=1))
+    return 0
+
+
+def cmd_synth(a: argparse.Namespace) -> int:
+    from sparc.data.synthetic import main as synth_main
+
+    return synth_main(a.rest)
+
+
 def cmd_profile(a: argparse.Namespace) -> int:
     from sparc.tools.bakeoff import profile_table
 
@@ -59,7 +111,41 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--baseline", type=float, default=None, help="expected baseline in metres (sanity check)")
     r.set_defaults(fn=cmd_rig)
 
-    from sparc.nn.backbone import BACKBONES
+    from sparc.data.converters import REGISTRY
+    from sparc.nn.backbones_spec import BACKBONES
+
+    c = sub.add_parser("convert", help="convert a public dataset to SPARC samples: convert <source> -- <source args>")
+    c.add_argument("source", choices=sorted(REGISTRY))
+    c.add_argument("rest", nargs=argparse.REMAINDER, help="arguments of the source converter (see convert <source> -- --help)")
+    c.set_defaults(fn=cmd_convert)
+
+    t = sub.add_parser("train", help="train SPARC on converted sources")
+    t.add_argument("--cfg", required=True, help="training config YAML (sparc/cfg/stage_a.yaml)")
+    t.add_argument("--data", required=True, help="data manifest YAML (sources, weights)")
+    t.add_argument("--out", required=True, help="run directory")
+    t.add_argument("--resume", default=None, help="checkpoint to resume (weights/last.pt)")
+    t.add_argument("--signs", default=None, help="saved sign vocabulary (default: union of the manifests)")
+    t.add_argument("--device", default=None)
+    for k, typ in (("epochs", int), ("batch", int), ("workers", int), ("epoch-size", int), ("lr", float)):
+        t.add_argument(f"--{k}", type=typ, default=None, dest=k.replace("-", "_"))
+    t.add_argument("--amp", default=None, choices=["bf16", "fp16", "none"])
+    t.add_argument("--backbone", default=None)
+    t.add_argument("--pretrained", default=None, type=lambda v: v.lower() in ("1", "true", "yes"))
+    t.add_argument("--distill", default=None, type=lambda v: v.lower() in ("1", "true", "yes"))
+    t.set_defaults(fn=cmd_train)
+
+    v = sub.add_parser("val", help="evaluate a checkpoint on the manifest's validation sources")
+    v.add_argument("--weights", required=True)
+    v.add_argument("--data", required=True)
+    v.add_argument("--out", required=True)
+    v.add_argument("--signs", default=None)
+    v.add_argument("--device", default=None)
+    v.add_argument("--workers", type=int, default=None)
+    v.set_defaults(fn=cmd_val)
+
+    sy = sub.add_parser("synth", help="write a synthetic dataset: synth -- --dst DIR [--n-train N --n-val M]")
+    sy.add_argument("rest", nargs=argparse.REMAINDER)
+    sy.set_defaults(fn=cmd_synth)
 
     pr = sub.add_parser("profile", help="params / GFLOPs per stage on CPU for each backbone candidate")
     pr.add_argument("--backbones", nargs="+", default=list(BACKBONES), choices=list(BACKBONES))
@@ -85,6 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     a = build_parser().parse_args(argv)
+    if getattr(a, "rest", None) and a.rest[:1] == ["--"]:
+        a.rest = a.rest[1:]
     return a.fn(a)
 
 

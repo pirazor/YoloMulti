@@ -185,17 +185,26 @@ def test_sparc_deploy_contract_and_ego_position():
     dep = SparcDeploy(net)
     with torch.no_grad():
         outs = dict(zip(dep.output_names(), dep(*inp.values())))
-    assert outs["agents"].shape == (1, 200, 18) and outs["da"].dtype == torch.int32
-    assert outs["bev"].shape == (1, 7, 240, 160) and outs["lane_meta"].shape == (1, 24, 9)
+    assert outs["agents"].shape == (1, 200, 14) and outs["da"].dtype == torch.int32
+    assert outs["elements"].shape == (1, 50, 10) and outs["lane_pts"].shape == (1, 24, 20, 2)
+    assert outs["lane_vis"].shape == (1, 24, 20) and outs["lane_meta"].shape == (1, 24, 9) and outs["bev"].shape == (1, 7, 240, 160)
     a = outs["agents"][0]
-    assert (a[:, 2] > a[:, 0]).all() and (a[:, 4] >= 0).all() and (a[:, 4] <= 1).all()
+    assert (a[:, 2] > a[:, 0]).all() and (a[:, 4] >= 0).all() and (a[:, 4] <= 1).all() and (a[:, 5] < 8).all()
+    e = outs["elements"][0]
+    assert (e[:, 5] < 2).all() and (e[:, 6] < 13).all() and (e[:, 7] <= 1).all() and (e[:, 8] == 0).all()  # n_sign = 1
     assert set(outs["lane_meta"][0, :, 1].tolist()) <= {-3.0, -2.0, -1.0, 1.0, 2.0, 3.0}
+    assert outs["lane_pts"][..., 0].abs().max() < 16.0
     # x_ego / y_ego is the box centre (pixel-edge coordinates) back-projected at the predicted depth
     Kc, T = inp["K"][0], inp["cam2ego"][0]
     cx, cy, z = (a[0, 0] + a[0, 2]) / 2 - 0.5, (a[0, 1] + a[0, 3]) / 2 - 0.5, a[0, 6]
     p = torch.stack([(cx - Kc[0, 2]) / Kc[0, 0] * z, (cy - Kc[1, 2]) / Kc[1, 1] * z, z])
-    e = T[:3, :3] @ p + T[:3, 3]
-    assert a[0, 12].item() == pytest.approx(e[0].item(), rel=1e-4) and a[0, 13].item() == pytest.approx(e[1].item(), abs=1e-4)
+    e3 = T[:3, :3] @ p + T[:3, 3]
+    assert a[0, 12].item() == pytest.approx(e3[0].item(), rel=1e-4) and a[0, 13].item() == pytest.approx(e3[1].item(), abs=1e-4)
+    # training mode: per-layer aux outputs and dense encoder proposals
+    net.train()
+    out = net(**inp)
+    assert len(out["aux"]) == 2 and out["enc_logits"].shape[-1] == 10 and out["enc_box"].shape[-1] == 4
+    assert out["enc_box"].shape[1] == out["enc_logits"].shape[1] and out["el_sign_logits"].shape == (1, 50, 1)
 
 
 def test_stage_cuts_and_input_names():

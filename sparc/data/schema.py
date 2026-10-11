@@ -1,22 +1,28 @@
-"""One training sample, whatever the source dataset (BDD100K, CULane, MTSD, nuScenes front camera, own drives).
+"""One training sample, whatever the source dataset (BDD100K, CULane, OpenLane, MTSD, ZOD, nuScenes, own drives).
 
 Every converter writes the same thing: one ``<stem>.npz`` per frame holding the arrays plus a JSON header (paths,
 calibration, provenance and the :class:`LabelMask`). Image, depth and mask files stay next to it as ordinary
 image files, referenced by path relative to the ``.npz``.
 
 The label mask is the core of multi-dataset training: a loss term is computed only on samples whose source labels
-that term (``label_mask``), and the 2D classification loss only over the classes the source annotates
-(``cls_vocab``, Null-BCE); a missing label is never treated as a negative.
+that term (``label_mask``), and the classification losses only over the classes the source annotates exhaustively
+(``cls_vocab`` for road users, ``el_vocab`` for traffic elements; Null-BCE); a missing label is never a negative.
 
 Conventions
 -----------
-* Pixel coordinates are in the **native** image (the converter's output resolution), x right, y down.
-* ``K`` is the 3x3 pinhole matrix of ``image``. For stereo samples both eyes are rectified with the same ``K``
-  and ``baseline_m`` is the rectified baseline, so ``depth = K[0,0] * baseline_m / disparity``.
+* Pixel coordinates are in the **native** image (the converter's output resolution), x right, y down, pixel
+  centres at integer coordinates.
+* ``K`` is the 3x3 pinhole matrix of ``image``; ``calib`` says whether it was measured or is a dataset-level guess
+  (``nominal``: BDD100K, CULane, ... have no calibration). For stereo samples both eyes are rectified with the same
+  ``K`` and ``baseline_m`` is the rectified baseline, so ``depth = K[0,0] * baseline_m / disparity``.
 * Camera frame: x right, y down, z forward. Ego frame: x forward, y left, z up, origin on the ground below the
-  camera (so ``cam2ego`` carries the mounting height, pitch and roll).
+  camera (``cam2ego`` carries the mounting height, pitch and roll; nominal sources get a nominal mount).
+* Road users (``boxes2d``/``cls``, 8 classes) and traffic elements (``el_*``: lights and signs) are separate
+  tables; the 10-class BDD100K detection benchmark is their union (:data:`BDD_CLASSES`).
 * ``box3d`` rows: ``(depth z_cam, yaw, length, width, height, x_ego, y_ego)``, metres and radians; yaw is the
   heading in the ego frame (0 = same direction as ego, counter-clockwise positive). NaN rows = no 3D label.
+* Lanes are polylines in native pixels (``points``) and, when the source has them, in the ego frame
+  (``points3d``). Order / direction / continuity / type follow the constants below.
 * Depth files: uint16 PNG in millimetres, 0 = invalid.
 """
 
@@ -29,80 +35,94 @@ from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-DET_CLASSES = ("pedestrian", "rider", "car", "truck", "bus", "train", "motorcycle", "bicycle", "traffic light",
-               "traffic sign")  # BDD100K detection classes
-CLS_TRAFFIC_LIGHT = DET_CLASSES.index("traffic light")
-CLS_TRAFFIC_SIGN = DET_CLASSES.index("traffic sign")
-TL_COLORS = ("none", "red", "yellow", "green")  # BDD100K trafficLightColor ("NA" -> none)
+AGENT_CLASSES = ("pedestrian", "rider", "car", "truck", "bus", "train", "motorcycle", "bicycle")
+ELEMENT_CLASSES = ("traffic_light", "traffic_sign")
+EL_LIGHT, EL_SIGN = 0, 1
+BDD_CLASSES = AGENT_CLASSES + ("traffic light", "traffic sign")  # the 10-class BDD100K detection benchmark
+# traffic-element attributes (OpenLane-V2): colour of a light, or the meaning of a light arrow / sign
+ELEMENT_ATTRS = ("unknown", "red", "green", "yellow", "go_straight", "turn_left", "turn_right", "no_left_turn",
+                 "no_right_turn", "u_turn", "no_u_turn", "slight_left", "slight_right")
+ATTR_FLIP = {ELEMENT_ATTRS.index(a): ELEMENT_ATTRS.index(b) for a, b in
+             (("turn_left", "turn_right"), ("turn_right", "turn_left"), ("no_left_turn", "no_right_turn"),
+              ("no_right_turn", "no_left_turn"), ("slight_left", "slight_right"), ("slight_right", "slight_left"))}
 
-LANE_ORDER_RANGE = 3  # order relative to ego: -3..-1 left of ego lane, 1..3 right; 0 is unused (a marking is never "the ego lane")
+LANE_ORDER_RANGE = 3  # order relative to ego: -3..-1 left of the ego lane, 1..3 right; 0 is unused
+LANE_ORDER_UNLABELLED = -99
 LANE_DIRECTIONS = ("same", "opposing", "boundary")  # travel direction of the lane on the far side of the marking
 LANE_CONTINUITY = ("solid", "dashed")
 LANE_TYPES = ("single_white", "single_yellow", "double_white", "double_yellow", "curb", "other")
+LANE_X_ANCHORS = np.geomspace(3.0, 60.0, 20)  # forward distances (m) at which a lane is predicted
 DA_CLASSES = ("background", "direct", "alternative")
+LANE_MASK_CLASSES = ("background", "marking")
 BEV_HW = (240, 160)  # 48 m forward x 32 m lateral at 0.2 m
 BEV_RES_M = 0.2
 LICENCES = ("bsd", "research", "own")
 DEPTH_SOURCES = ("none", "stereo", "lidar", "pseudo")
-
-LABEL_KEYS = (
-    "det",          # 2D boxes + class over cls_vocab
-    "tl",           # traffic-light colour on traffic-light boxes
-    "sign",         # fine sign class (MTSD) on traffic-sign boxes
-    "box3d",        # 3D state on (some) boxes
-    "track",        # track ids consistent within clip_id
-    "depth",        # dense depth file
-    "da",           # drivable-area mask
-    "lane_geom",    # lane polylines (geometry + existence)
-    "lane_order", "lane_dir", "lane_cont", "lane_type",  # lane attributes
-    "lane_mask",    # rasterised lane-marking mask
-    "bev_da", "bev_lane", "bev_agent",  # BEV layers
-)
+CALIBS = ("measured", "nominal")
 
 
 @dataclass
 class LabelMask:
     """Which labels the source provides for this frame. Absent == unknown, never "negative"."""
 
-    det: bool = False
-    tl: bool = False
-    sign: bool = False
-    box3d: bool = False
-    track: bool = False
-    depth: bool = False
-    da: bool = False
-    lane_geom: bool = False
+    agents: bool = False      # road-user boxes + class over cls_vocab
+    box3d: bool = False       # 3D state on (some) road users
+    track: bool = False       # track ids consistent within clip_id
+    elements: bool = False    # traffic-element boxes + class over el_vocab
+    el_attr: bool = False     # light colour / arrow or sign meaning
+    el_sign: bool = False     # fine sign class (name)
+    topology: bool = False    # element -> governed lane
+    depth: bool = False       # dense depth file
+    da: bool = False          # drivable-area mask
+    lane_geom: bool = False   # lane polylines (geometry + existence)
+    lane_3d: bool = False     # lane points in the ego frame (not a ground-plane lift)
     lane_order: bool = False
     lane_dir: bool = False
     lane_cont: bool = False
     lane_type: bool = False
-    lane_mask: bool = False
+    lane_mask: bool = False   # rasterised lane-marking mask
     bev_da: bool = False
     bev_lane: bool = False
     bev_agent: bool = False
-    # classes the 2D detection labels are exhaustive for (Null-BCE); empty when det is False
-    cls_vocab: tuple = ()
+    cls_vocab: tuple = ()     # road-user classes the labels are exhaustive for (Null-BCE); empty when agents is False
+    el_vocab: tuple = ()      # element classes the labels are exhaustive for
 
     def __post_init__(self) -> None:
         self.cls_vocab = tuple(int(c) for c in self.cls_vocab)
-        bad = [c for c in self.cls_vocab if not 0 <= c < len(DET_CLASSES)]
+        self.el_vocab = tuple(int(c) for c in self.el_vocab)
+        bad = [c for c in self.cls_vocab if not 0 <= c < len(AGENT_CLASSES)]
         if bad:
-            raise ValueError(f"cls_vocab has ids outside 0..{len(DET_CLASSES) - 1}: {bad}")
-        if self.det and not self.cls_vocab:
-            raise ValueError("det=True needs a non-empty cls_vocab (the classes this source annotates exhaustively)")
-        if not self.det and self.cls_vocab:
-            raise ValueError("cls_vocab given but det=False")
+            raise ValueError(f"cls_vocab has ids outside 0..{len(AGENT_CLASSES) - 1}: {bad}")
+        bad = [c for c in self.el_vocab if not 0 <= c < len(ELEMENT_CLASSES)]
+        if bad:
+            raise ValueError(f"el_vocab has ids outside 0..{len(ELEMENT_CLASSES) - 1}: {bad}")
+        if self.agents != bool(self.cls_vocab):
+            raise ValueError("agents=True needs a non-empty cls_vocab (and cls_vocab needs agents=True)")
+        if self.elements != bool(self.el_vocab):
+            raise ValueError("elements=True needs a non-empty el_vocab (and el_vocab needs elements=True)")
+        if (self.box3d or self.track) and not self.agents:
+            raise ValueError("box3d / track labels need agents")
+        if (self.el_attr or self.el_sign or self.topology) and not self.elements:
+            raise ValueError("el_attr / el_sign / topology need elements")
+        if (self.lane_3d or self.lane_order or self.lane_dir or self.lane_cont or self.lane_type or
+                self.topology) and not self.lane_geom:
+            raise ValueError("lane attributes / lane_3d / topology need lane_geom")
 
     def vocab_mask(self) -> np.ndarray:
-        m = np.zeros(len(DET_CLASSES), dtype=bool)
+        m = np.zeros(len(AGENT_CLASSES), dtype=bool)
         m[list(self.cls_vocab)] = True
+        return m
+
+    def el_vocab_mask(self) -> np.ndarray:
+        m = np.zeros(len(ELEMENT_CLASSES), dtype=bool)
+        m[list(self.el_vocab)] = True
         return m
 
     def to_dict(self) -> Dict:
         d = asdict(self)
-        d["cls_vocab"] = list(self.cls_vocab)
+        d["cls_vocab"], d["el_vocab"] = list(self.cls_vocab), list(self.el_vocab)
         return d
 
     @classmethod
@@ -115,13 +135,15 @@ class LabelMask:
 
 @dataclass
 class LaneInstance:
-    """One lane marking (or curb) as a polyline in native pixels, ordered bottom (near) to top (far).
+    """One lane marking (or curb): a polyline in native pixels, ordered near (bottom) to far (top), plus
+    optionally the same polyline in the ego frame (``points3d``, metres; sources with 3D lanes).
 
-    Attributes are -1 when unlabelled. ``weak`` marks attributes derived by rules (lane_rules.py) rather than by a
+    Attributes are -1 (order: -99) when unlabelled. ``weak`` marks attributes derived by rules rather than by a
     person; their loss weight is reduced and they are never used for reported accuracy."""
 
-    points: np.ndarray  # (M, 2) float32, x, y
-    order: int = -99    # -3..3 without 0; -99 = unlabelled
+    points: np.ndarray                      # (M, 2) float32, x, y
+    points3d: Optional[np.ndarray] = None   # (M, 3) float32 ego x, y, z (same M as points, or any M >= 2)
+    order: int = LANE_ORDER_UNLABELLED
     direction: int = -1
     continuity: int = -1
     ltype: int = -1
@@ -133,7 +155,11 @@ class LaneInstance:
             raise ValueError("a lane needs at least 2 points")
         if not np.isfinite(self.points).all():
             raise ValueError("lane points must be finite")
-        if self.order != -99 and (self.order == 0 or abs(self.order) > LANE_ORDER_RANGE):
+        if self.points3d is not None:
+            self.points3d = np.asarray(self.points3d, dtype=np.float32).reshape(-1, 3)
+            if len(self.points3d) < 2 or not np.isfinite(self.points3d).all():
+                raise ValueError("points3d needs >= 2 finite points")
+        if self.order != LANE_ORDER_UNLABELLED and (self.order == 0 or abs(self.order) > LANE_ORDER_RANGE):
             raise ValueError(f"lane order {self.order} outside -{LANE_ORDER_RANGE}..{LANE_ORDER_RANGE} (0 excluded)")
         for name, n in (("direction", len(LANE_DIRECTIONS)), ("continuity", len(LANE_CONTINUITY)), ("ltype", len(LANE_TYPES))):
             v = getattr(self, name)
@@ -145,6 +171,13 @@ def _f32(a, shape_tail: Sequence[int]) -> np.ndarray:
     return np.asarray(a, dtype=np.float32).reshape(-1, *shape_tail)
 
 
+def _names(a, n: int) -> np.ndarray:
+    if a is None:
+        return np.full((n,), "", dtype="<U1")
+    out = np.asarray(list(a), dtype=str).reshape(-1) if not isinstance(a, np.ndarray) else a.astype(str).reshape(-1)
+    return out
+
+
 @dataclass
 class Sample:
     image: str
@@ -154,72 +187,89 @@ class Sample:
     source: str
     licence: str
     label_mask: LabelMask
+    calib: str = "measured"
     image_right: Optional[str] = None      # rectified right eye (same K), stereo sources only
     baseline_m: Optional[float] = None
     depth: Optional[str] = None
     depth_source: str = "none"
+    # road users
     boxes2d: np.ndarray = field(default_factory=lambda: np.zeros((0, 4), np.float32))
     cls: np.ndarray = field(default_factory=lambda: np.zeros((0,), np.int64))
-    tl_color: Optional[np.ndarray] = None  # (N,) -1 = unlabelled
-    sign_cls: Optional[np.ndarray] = None  # (N,) -1 = unlabelled
     box3d: Optional[np.ndarray] = None     # (N, 7), NaN rows = unlabelled
     track_id: Optional[np.ndarray] = None  # (N,) -1 = unlabelled
+    # traffic elements
+    el_boxes: np.ndarray = field(default_factory=lambda: np.zeros((0, 4), np.float32))
+    el_cls: np.ndarray = field(default_factory=lambda: np.zeros((0,), np.int64))
+    el_attr: Optional[np.ndarray] = None   # (M,) -1 = unlabelled, else index into ELEMENT_ATTRS
+    el_sign: Optional[np.ndarray] = None   # (M,) fine sign class *name* ("" = unlabelled); ids come from the manifest vocab
+    el_lane: Optional[np.ndarray] = None   # (M,) index into lanes of the governed lane, -1 = unlabelled
+    # lanes, masks, BEV
     lanes: List[LaneInstance] = field(default_factory=list)
     da_mask: Optional[str] = None
     lane_mask: Optional[str] = None
     bev: Optional[str] = None              # uint8 (C, 240, 160) .npy: drivable class, lane line, heading bin, agent
+    # sequence
     clip_id: Optional[str] = None
     frame_idx: int = 0
     timestamp_ns: Optional[int] = None
     world_from_ego: Optional[np.ndarray] = None  # (4, 4) ego pose (GPS/IMU or dataset odometry)
 
     def __post_init__(self) -> None:
-        n = len(np.asarray(self.boxes2d).reshape(-1, 4))
         self.boxes2d = _f32(self.boxes2d, (4,))
         self.cls = np.asarray(self.cls, dtype=np.int64).reshape(-1)
+        self.el_boxes = _f32(self.el_boxes, (4,))
+        self.el_cls = np.asarray(self.el_cls, dtype=np.int64).reshape(-1)
         self.K = np.asarray(self.K, dtype=np.float64).reshape(3, 3)
         self.cam2ego = np.asarray(self.cam2ego, dtype=np.float64).reshape(4, 4)
         self.hw = (int(self.hw[0]), int(self.hw[1]))
+        n, m = len(self.boxes2d), len(self.el_boxes)
 
-        def per_box(a, fill, dtype, tail=()):
+        def per(a, count, fill, dtype, tail=()):
             if a is None:
-                return np.full((n, *tail), fill, dtype=dtype)
+                return np.full((count, *tail), fill, dtype=dtype)
             return np.asarray(a, dtype=dtype).reshape(-1, *tail)
 
-        self.tl_color = per_box(self.tl_color, -1, np.int64)
-        self.sign_cls = per_box(self.sign_cls, -1, np.int64)
-        self.box3d = per_box(self.box3d, np.nan, np.float32, (7,))
-        self.track_id = per_box(self.track_id, -1, np.int64)
+        self.box3d = per(self.box3d, n, np.nan, np.float32, (7,))
+        self.track_id = per(self.track_id, n, -1, np.int64)
+        self.el_attr = per(self.el_attr, m, -1, np.int64)
+        self.el_lane = per(self.el_lane, m, -1, np.int64)
+        self.el_sign = _names(self.el_sign, m)
         if self.world_from_ego is not None:
             self.world_from_ego = np.asarray(self.world_from_ego, dtype=np.float64).reshape(4, 4)
         self.validate()
 
     # ------------------------------------------------------------------ validation
     def validate(self) -> None:
-        n = len(self.boxes2d)
-        for name in ("cls", "tl_color", "sign_cls", "box3d", "track_id"):
-            if len(getattr(self, name)) != n:
-                raise ValueError(f"{name} has {len(getattr(self, name))} rows, boxes2d has {n}")
+        n, m = len(self.boxes2d), len(self.el_boxes)
+        for name, want in (("cls", n), ("box3d", n), ("track_id", n), ("el_cls", m), ("el_attr", m), ("el_sign", m), ("el_lane", m)):
+            if len(getattr(self, name)) != want:
+                raise ValueError(f"{name} has {len(getattr(self, name))} rows, expected {want}")
         if self.licence not in LICENCES:
             raise ValueError(f"licence {self.licence!r} not in {LICENCES}")
         if self.depth_source not in DEPTH_SOURCES:
             raise ValueError(f"depth_source {self.depth_source!r} not in {DEPTH_SOURCES}")
-        if not np.isfinite(self.boxes2d).all():
-            raise ValueError("boxes2d must be finite")
-        if n and ((self.boxes2d[:, 2] <= self.boxes2d[:, 0]) | (self.boxes2d[:, 3] <= self.boxes2d[:, 1])).any():
-            raise ValueError("boxes2d must be xyxy with x2 > x1 and y2 > y1")
-        if n and ((self.cls < 0) | (self.cls >= len(DET_CLASSES))).any():
-            raise ValueError(f"cls ids outside 0..{len(DET_CLASSES) - 1}")
+        if self.calib not in CALIBS:
+            raise ValueError(f"calib {self.calib!r} not in {CALIBS}")
+        for name, b in (("boxes2d", self.boxes2d), ("el_boxes", self.el_boxes)):
+            if not np.isfinite(b).all():
+                raise ValueError(f"{name} must be finite")
+            if len(b) and ((b[:, 2] <= b[:, 0]) | (b[:, 3] <= b[:, 1])).any():
+                raise ValueError(f"{name} must be xyxy with x2 > x1 and y2 > y1")
+        if n and ((self.cls < 0) | (self.cls >= len(AGENT_CLASSES))).any():
+            raise ValueError(f"cls ids outside 0..{len(AGENT_CLASSES) - 1}")
+        if m and ((self.el_cls < 0) | (self.el_cls >= len(ELEMENT_CLASSES))).any():
+            raise ValueError(f"el_cls ids outside 0..{len(ELEMENT_CLASSES) - 1}")
         lm = self.label_mask
-        if n and lm.det and not np.isin(self.cls, lm.cls_vocab).all():
-            raise ValueError("a box has a class outside the source's cls_vocab")
-        if (self.tl_color >= 0).any():
-            if (self.cls[self.tl_color >= 0] != CLS_TRAFFIC_LIGHT).any():
-                raise ValueError("tl_color set on a box that is not a traffic light")
-            if (self.tl_color >= len(TL_COLORS)).any():
-                raise ValueError("tl_color id out of range")
-        if (self.sign_cls >= 0).any() and (self.cls[self.sign_cls >= 0] != CLS_TRAFFIC_SIGN).any():
-            raise ValueError("sign_cls set on a box that is not a traffic sign")
+        if n and lm.agents and not np.isin(self.cls, lm.cls_vocab).all():
+            raise ValueError("a road-user box has a class outside the source's cls_vocab")
+        if m and lm.elements and not np.isin(self.el_cls, lm.el_vocab).all():
+            raise ValueError("an element box has a class outside the source's el_vocab")
+        if m and ((self.el_attr < -1) | (self.el_attr >= len(ELEMENT_ATTRS))).any():
+            raise ValueError("el_attr id out of range")
+        if m and (self.el_sign != "").any() and (self.el_cls[self.el_sign != ""] != EL_SIGN).any():
+            raise ValueError("a sign name is set on a box that is not a traffic sign")
+        if m and ((self.el_lane < -1) | (self.el_lane >= len(self.lanes))).any():
+            raise ValueError("el_lane points outside lanes")
         if self.K[2, 2] != 1 or self.K[0, 0] <= 0 or self.K[1, 1] <= 0:
             raise ValueError(f"K is not a pinhole matrix: {self.K.tolist()}")
         if not np.allclose(self.cam2ego[3], (0, 0, 0, 1)):
@@ -243,10 +293,8 @@ class Sample:
             raise ValueError("label_mask.box3d set but no box has a 3D label")
         if lm.track and self.clip_id is None:
             raise ValueError("track labels need a clip_id")
-        if (lm.lane_order or lm.lane_dir or lm.lane_cont or lm.lane_type) and not lm.lane_geom:
-            raise ValueError("lane attributes need lane_geom")
-        if (lm.tl or lm.sign or lm.box3d or lm.track) and not lm.det:
-            raise ValueError("per-box labels (tl, sign, box3d, track) need det")
+        if lm.lane_3d and self.lanes and not all(l.points3d is not None for l in self.lanes):
+            raise ValueError("label_mask.lane_3d set but a lane has no points3d")
 
     # ------------------------------------------------------------------ I/O
     def save(self, path: str | Path) -> Path:
@@ -255,18 +303,22 @@ class Sample:
         lanes = self.lanes
         lane_pts = np.concatenate([l.points for l in lanes]) if lanes else np.zeros((0, 2), np.float32)
         lane_len = np.array([len(l.points) for l in lanes], dtype=np.int64)
+        lane_xyz = np.concatenate([l.points3d for l in lanes if l.points3d is not None]) if any(
+            l.points3d is not None for l in lanes) else np.zeros((0, 3), np.float32)
+        lane_len3d = np.array([0 if l.points3d is None else len(l.points3d) for l in lanes], dtype=np.int64)
         lane_attr = np.array([[l.order, l.direction, l.continuity, l.ltype, int(l.weak)] for l in lanes],
                              dtype=np.int64).reshape(-1, 5)
         meta = {
             "schema": SCHEMA_VERSION, "image": self.image, "hw": list(self.hw), "source": self.source,
-            "licence": self.licence, "label_mask": self.label_mask.to_dict(), "image_right": self.image_right,
-            "baseline_m": self.baseline_m, "depth": self.depth, "depth_source": self.depth_source,
-            "da_mask": self.da_mask, "lane_mask": self.lane_mask, "bev": self.bev, "clip_id": self.clip_id,
-            "frame_idx": int(self.frame_idx), "timestamp_ns": self.timestamp_ns,
+            "licence": self.licence, "label_mask": self.label_mask.to_dict(), "calib": self.calib,
+            "image_right": self.image_right, "baseline_m": self.baseline_m, "depth": self.depth,
+            "depth_source": self.depth_source, "da_mask": self.da_mask, "lane_mask": self.lane_mask, "bev": self.bev,
+            "clip_id": self.clip_id, "frame_idx": int(self.frame_idx), "timestamp_ns": self.timestamp_ns,
         }
-        arrays = dict(K=self.K, cam2ego=self.cam2ego, boxes2d=self.boxes2d, cls=self.cls, tl_color=self.tl_color,
-                      sign_cls=self.sign_cls, box3d=self.box3d, track_id=self.track_id, lane_pts=lane_pts,
-                      lane_len=lane_len, lane_attr=lane_attr)
+        arrays = dict(K=self.K, cam2ego=self.cam2ego, boxes2d=self.boxes2d, cls=self.cls, box3d=self.box3d,
+                      track_id=self.track_id, el_boxes=self.el_boxes, el_cls=self.el_cls, el_attr=self.el_attr,
+                      el_sign=self.el_sign, el_lane=self.el_lane, lane_pts=lane_pts, lane_len=lane_len,
+                      lane_xyz=lane_xyz, lane_len3d=lane_len3d, lane_attr=lane_attr)
         if self.world_from_ego is not None:
             arrays["world_from_ego"] = self.world_from_ego
         np.savez_compressed(path, meta=np.array(json.dumps(meta)), **arrays)
@@ -277,15 +329,18 @@ class Sample:
         with np.load(path, allow_pickle=False) as z:
             meta = json.loads(str(z["meta"]))
             if meta.pop("schema") != SCHEMA_VERSION:
-                raise ValueError(f"{path}: schema version mismatch")
+                raise ValueError(f"{path}: schema version mismatch (file {meta.get('schema')}, code {SCHEMA_VERSION})")
             a = {k: z[k] for k in z.files if k != "meta"}
-        lanes, start = [], 0
-        for ln, attr in zip(a.pop("lane_len"), a.pop("lane_attr")):
-            pts = a["lane_pts"][start:start + ln]
-            start += ln
-            lanes.append(LaneInstance(pts, order=int(attr[0]), direction=int(attr[1]), continuity=int(attr[2]),
+        lanes, s2, s3 = [], 0, 0
+        for ln, ln3, attr in zip(a.pop("lane_len"), a.pop("lane_len3d"), a.pop("lane_attr")):
+            pts = a["lane_pts"][s2:s2 + ln]
+            s2 += ln
+            xyz = a["lane_xyz"][s3:s3 + ln3] if ln3 else None
+            s3 += ln3
+            lanes.append(LaneInstance(pts, xyz, order=int(attr[0]), direction=int(attr[1]), continuity=int(attr[2]),
                                       ltype=int(attr[3]), weak=bool(attr[4])))
         a.pop("lane_pts")
+        a.pop("lane_xyz")
         meta["label_mask"] = LabelMask.from_dict(meta["label_mask"])
         meta["hw"] = tuple(meta["hw"])
         return cls(**meta, **a, lanes=lanes)
@@ -309,3 +364,10 @@ def ground_cam2ego(height_m: float, pitch_rad: float = 0.0, roll_rad: float = 0.
     T[:3, :3] = base @ pitch @ roll
     T[:3, 3] = (0.0, 0.0, height_m)
     return T
+
+
+def flip_cam2ego(T: np.ndarray) -> np.ndarray:
+    """``cam2ego`` of the horizontally mirrored scene (camera x -> -x, ego y -> -y)."""
+    M_cam = np.diag([-1.0, 1.0, 1.0, 1.0])
+    M_ego = np.diag([1.0, -1.0, 1.0, 1.0])
+    return M_ego @ np.asarray(T, dtype=np.float64) @ M_cam
