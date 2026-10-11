@@ -83,6 +83,20 @@ criterion on perfect predictions (near-zero loss) and its gating / vocabulary ma
 (loop, validation, checkpoint, resume, CLI) and, opt-in (`ADAS_SLOW_TESTS=1`), that the smoke model learns the
 synthetic scenes.
 
+### Measured on synthetic scenes (CPU, `sparc/cfg/smoke.yaml`: YOLO26s trunk from random init, 192x320, 48 train / 8 val frames, 150 epochs x 6 iterations)
+
+| epoch | train loss | lane offset err (m) | agents mAP50 / 50-95 | elements mAP50 | light colour acc | sign top-1 | DA mIoU | lane F1 (CULane 30 px) | lane order acc |
+|---|---|---|---|---|---|---|---|---|---|
+| 40 | 20.7 | 1.06 | 0.51 / 0.21 | 0.33 | 0.63 | 0.25 | 0.78 | 0.05 | 1.0 |
+| 100 | 12.1 | 0.41 | 0.67 / 0.36 | 0.64 | 0.89 | 0.67 | 0.87 | 0.38 | 1.0 |
+| 150 (best 129) | 9.9 | 0.24 | 0.64 / 0.40 | 0.70 | 0.75 | 0.63 | 0.87 | 0.48 | 1.0 |
+
+Every output learns from random initialisation; the validation set is 8 frames, so the element / sign / light
+numbers move by +-0.2 between epochs. Before the review fixes (camera conditioning of the metric heads, lane range),
+the same run reached agents mAP50-95 0.27, elements mAP50 0.41, light colour 0.17 and a lane offset error of
+0.57 m: the camera embedding is what lets the metric heads cope with the scale / translation augmentation. None of
+this says anything about real roads; it says the pipeline is wired correctly.
+
 Not in stage A yet (planned stages): D-FINE box distributions and denoising queries (recipe refinements), mosaic
 for 2D-only samples, the lane rule fallback for BDD100K direction labels, the topology head, depth / BEV / temporal
 parts (stages B-C), the Colab notebook for stage A.
