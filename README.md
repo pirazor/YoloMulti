@@ -10,12 +10,43 @@ The previous YOLOv13-based implementation lives in [`legacy/yolov13/`](legacy/yo
 (tag `yolov13-mt-baseline`) and is kept as the A0 baseline for ablations.
 
 ```
-adas_mt/        new package (data, nn, distill, engine, export, deploy)
+sparc/          next-generation network (design: docs/sparc/plan.md), Phase 0: bake-off tooling, rig geometry, schema
+adas_mt/        YOLO26-based multi-task model (data, nn, distill, engine, export, deploy); the A0 baseline for SPARC
 sign_classifier/ fine-grained traffic-sign classifier (unchanged)
+recording/      recording specification for own drives (any stereo + IMU + GNSS rig)
 legacy/yolov13/ previous YOLOv13 multi-task implementation (frozen baseline)
 ```
 
-## Train on Google Colab
+## SPARC (in progress)
+
+One temporal sparse-query network for a front camera + IMU + GNSS on a Jetson Orin: road users with 3D state and
+tracking, traffic-light colour and fine sign class, lanes with ego order and travel direction, drivable area, a BEV
+map and light-to-lane topology. Depth is an auxiliary signal (optional input, training target), never a dependency;
+training starts on public datasets ([design and plan](docs/sparc/plan.md)). Phase 0
+([report](docs/sparc/phase0.md)) measures the backbone candidates and the TensorRT-critical ops on the device;
+stage A ([guide](docs/sparc/stage_a.md)) converts the public datasets and trains the 2D model:
+
+```bash
+python -m sparc rig --calib stereo_calib.yaml --baseline 0.10   # FOV, network intrinsics, depth precision vs range
+python -m sparc profile --stereo                                # params / GFLOPs per component and candidate
+python -m sparc bakeoff export --out runs/bakeoff               # then on the Jetson: python3 runs/bakeoff/run_on_device.py
+python -m sparc bakeoff report --out runs/bakeoff
+python -m sparc convert bdd100k -- --root /data/bdd100k --dst data/sparc/bdd100k   # and culane, openlane, mtsd, zod, ...
+python -m sparc train --cfg sparc/cfg/stage_a.yaml --data sparc/cfg/data_stage_a.yaml --out runs/sparc/stage_a
+python -m sparc val --weights runs/sparc/stage_a/weights/best.pt --data sparc/cfg/data_stage_a.yaml --out runs/sparc/val
+python -m sparc export --weights runs/sparc/stage_a/weights/best.pt   # ONNX + op audit + onnxruntime parity
+```
+
+**Stage A on a Colab A100**:
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pirazor/YoloMulti/blob/multitask/colab/train_sparc.ipynb)
+[`colab/train_sparc.ipynb`](colab/train_sparc.ipynb) takes the original dataset downloads from a Google Drive folder,
+unpacks and converts them (`python -m sparc prepare`, conversions cached on Drive), checks the labels visually,
+measures throughput and the expected training time, trains with resume across sessions, and ends with per-source
+metrics, the stage A acceptance table, prediction overlays and the ONNX export. Start with the `smoke` preset
+(synthetic data, ~15 min), then `quick`, then `full`. The default DINOv3 weights may need an `HF_TOKEN` Colab secret
+(the notebook falls back to DINOv2 otherwise). Regenerate it with `python colab/build_train_sparc.py`.
+
+## Train on Google Colab (adas_mt)
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pirazor/YoloMulti/blob/main/colab/train_adas_mt.ipynb)
 [`colab/train_adas_mt.ipynb`](colab/train_adas_mt.ipynb): data (a Supervisely export, a converted dataset, or a

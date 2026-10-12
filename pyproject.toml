@@ -26,7 +26,7 @@ version = { attr = "adas_mt.__version__" }
 adas_mt = ["cfg/*.yaml"]
 
 [tool.setuptools.packages.find]
-include = ["adas_mt*", "sign_classifier*"]
+include = ["adas_mt*", "sparc*", "sign_classifier*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

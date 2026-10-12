@@ -1,0 +1,31 @@
+# CPU smoke test on synthetic data (python -m sparc synth --dst /tmp/syn; python -m sparc train --cfg sparc/cfg/smoke.yaml --data <manifest>)
+model:
+  backbone: yolo26s
+  pretrained: false
+  imgsz: [192, 320]
+  hfov: 60.0
+  decoder_layers: 2
+  n_agents: 60
+  n_elements: 20
+  n_lanes: 12
+  bev: false
+  lane_aux: true
+aug:
+  scale: [0.9, 1.1]
+  translate: 0.05
+  hflip: 0.5
+  hsv_h: 0.0
+  hsv_s: 0.2
+  hsv_v: 0.2
+distill:
+  enabled: false
+epochs: 3
+batch: 4
+workers: 0
+lr: 3.0e-4
+backbone_lr_mult: 1.0
+warmup_iters: 10
+grad_clip: 0.1
+amp: none
+ema: 0.99
+log_every: 5

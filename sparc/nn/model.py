@@ -1,0 +1,237 @@
+"""SPARC network: backbone -> hybrid encoder -> typed-query decoder + dense head + (stereo) + BEV head.
+
+``SparcNet.forward`` returns raw head outputs (training / evaluation in PyTorch). ``SparcDeploy`` wraps it with the
+engine I/O contract (``docs/sparc/plan.md`` section 5) and post-processing that belongs in the graph.
+
+Inputs (all float32): ``image`` (B, 3, H, W) RGB in [0, 1] in the virtual camera; ``K`` (B, 3, 3) at network
+pixels; ``cam2ego`` (B, 4, 4) (both condition the metric heads); and optionally ``depth`` (B, 1, H, W) metres
+(0 = invalid; any depth source) or, with ``stereo=True``, ``image_right`` (B, 3, H, W) + ``baseline`` (B, 1) metres.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Sequence
+
+import torch
+import torch.nn as nn
+
+from sparc.data.schema import DA_CLASSES, LANE_ORDER_RANGE, LANE_X_ANCHORS
+from sparc.nn.backbone import build_backbone
+from sparc.nn.bev import BEVGrid, BEVHead
+from sparc.nn.common import Normalize, l2_normalize
+from sparc.nn.decoder import DecoderCfg, TypedQueryDecoder
+from sparc.nn.dense import DenseHead
+from sparc.nn.encoder import HybridEncoder
+from sparc.nn.stereo import StereoHead
+
+STAGES = ("backbone", "encoder", "decoder", "full")
+
+
+@dataclass
+class SparcCfg:
+    backbone: str = "vit_s16_dinov3"
+    imgsz: tuple = (384, 640)
+    pretrained: bool = False
+    decoder: DecoderCfg = field(default_factory=DecoderCfg)
+    enc_depth: int = 1
+    enc_expansion: float = 0.5
+    bev: bool = True
+    bev_splat: bool = True
+    bev_ipm: bool = True
+    stereo: bool = False
+    max_disp: int = 192
+    lane_aux: bool = True  # training-only lane-marking mask head (not exported)
+
+
+class SparcNet(nn.Module):
+    def __init__(self, cfg: SparcCfg = SparcCfg()):
+        super().__init__()
+        self.cfg = cfg
+        self.norm = Normalize()
+        self.backbone = build_backbone(cfg.backbone, cfg.imgsz, cfg.pretrained)
+        self.encoder = HybridEncoder(self.backbone.out_channels, cfg.decoder.d, cfg.enc_depth, cfg.enc_expansion)
+        self.decoder = TypedQueryDecoder(cfg.decoder, levels=3)
+        self.da_head = DenseHead(len(DA_CLASSES), cfg.decoder.d)
+        self.lane_aux = DenseHead(2, cfg.decoder.d) if cfg.lane_aux else None
+        self.stereo = StereoHead(cfg.max_disp) if cfg.stereo else None
+        self.bev = BEVHead(cfg.decoder.d, splat=cfg.bev_splat, ipm=cfg.bev_ipm) if cfg.bev else None
+
+    def forward(self, image, K=None, cam2ego=None, depth=None, image_right=None, baseline=None,
+                until: str = "full") -> Dict[str, torch.Tensor]:
+        if until not in STAGES:
+            raise ValueError(f"until must be one of {STAGES}")
+        x = self.norm(image)
+        feats = self.backbone(x)
+        if until == "backbone":
+            return feats
+        enc = self.encoder([feats["p3"], feats["p4"], feats["p5"]])
+        if until == "encoder":
+            return {"p2": feats["p2"], "e3": enc[0], "e4": enc[1], "e5": enc[2]}
+        out = self.decoder(enc, K, cam2ego, tuple(image.shape[-2:]))
+        if until == "decoder":
+            return out
+        if self.training:
+            out["enc_feats"] = enc  # for the distillation hook (stride 8 / 16 / 32)
+        out["da_logits"] = self.da_head(feats["p2"], enc[0])
+        if self.lane_aux is not None and self.training:
+            out["lane_mask_logits"] = self.lane_aux(feats["p2"], enc[0])
+        if self.stereo is not None and image_right is not None:
+            if baseline is None or K is None:
+                raise ValueError("the stereo head needs baseline and K with image_right")
+            out["disparity"] = self.stereo(x, self.norm(image_right))
+            if depth is None:  # a given depth (training on a source with better depth) takes precedence for the BEV
+                depth = StereoHead.to_depth(out["disparity"], K, baseline)
+            out["depth"] = StereoHead.to_depth(out["disparity"], K, baseline)
+        elif self.stereo is not None and depth is None and self.bev is not None and self.bev.splat is not None:
+            raise ValueError("stereo=True needs image_right and baseline (or a depth map for monocular sources)")
+        if self.bev is not None:
+            if K is None or cam2ego is None:
+                raise ValueError("the BEV head needs K and cam2ego")
+            if depth is None:
+                if self.bev.splat is not None:
+                    raise ValueError("the depth splat needs depth (an input, or stereo=True)")
+                depth = torch.zeros_like(image[:, :1])
+            out["bev"] = self.bev(enc[0], depth, K, cam2ego)
+        return out
+
+    def input_names(self, until: str = "full"):
+        names = ["image"]
+        if until in ("decoder", "full"):
+            names += ["K", "cam2ego"]  # metric heads are conditioned on the camera
+        if until == "full":
+            if self.stereo is not None:
+                names += ["image_right", "baseline"]
+            elif self.bev is not None and self.bev.splat is not None:
+                names += ["depth"]
+        return names
+
+
+ORDER_VALUES = [o for o in range(-LANE_ORDER_RANGE, LANE_ORDER_RANGE + 1) if o != 0]
+AGENT_COLUMNS = ("x1", "y1", "x2", "y2", "score", "cls", "depth", "yaw_sin", "yaw_cos", "length", "width", "height",
+                 "x_ego", "y_ego")
+ELEMENT_COLUMNS = ("x1", "y1", "x2", "y2", "score", "cls", "attr_id", "attr_p", "sign_id", "sign_p")
+LANE_META_COLUMNS = ("exist", "order", "order_p", "dir_id", "dir_p", "cont_id", "cont_p", "type_id", "type_p")
+
+
+def _top1(logits: torch.Tensor):
+    p = logits.softmax(-1)
+    v, i = p.max(-1)
+    return i.to(logits.dtype), v
+
+
+def _xyxy(cxcywh_norm: torch.Tensor, w: int, h: int) -> torch.Tensor:
+    scale = torch.tensor([w, h, w, h], dtype=cxcywh_norm.dtype, device=cxcywh_norm.device)
+    b = cxcywh_norm * scale
+    return torch.cat([b[..., :2] - b[..., 2:] / 2, b[..., :2] + b[..., 2:] / 2], -1), b
+
+
+class SparcDeploy(nn.Module):
+    """Engine I/O contract around :class:`SparcNet` (positional inputs in ``input_names`` order).
+
+    Outputs: ``agents`` (B, N, 14) = :data:`AGENT_COLUMNS` (pixels of the network input, ego metres),
+    ``agent_emb`` (B, N, 64), ``elements`` (B, M, 10) = :data:`ELEMENT_COLUMNS`, ``lane_pts`` (B, L, A, 2) = lateral
+    offset y and height z (m) at :data:`LANE_X_ANCHORS`, ``lane_vis`` (B, L, A) probabilities, ``lane_meta``
+    (B, L, 9) = :data:`LANE_META_COLUMNS`, ``da`` (B, H, W) int32 class map, then ``depth`` / ``bev`` when present."""
+
+    def __init__(self, net: SparcNet, until: str = "full"):
+        super().__init__()
+        self.net, self.until = net.eval(), until
+        self.inputs = net.input_names(until)
+        self.register_buffer("order_values", torch.tensor(ORDER_VALUES, dtype=torch.float32), persistent=False)
+        self.register_buffer("lane_x", torch.tensor(LANE_X_ANCHORS, dtype=torch.float32), persistent=False)
+
+    def output_names(self):
+        if self.until == "backbone":
+            return ["p2", "p3", "p4", "p5"]
+        if self.until == "encoder":
+            return ["p2", "e3", "e4", "e5"]
+        names = ["agents", "agent_emb", "elements", "lane_pts", "lane_vis", "lane_meta"]
+        if self.until == "full":
+            names.append("da")
+            if self.net.stereo is not None:
+                names.append("depth")
+            if self.net.bev is not None:
+                names.append("bev")
+        return names
+
+    def forward(self, *args):
+        kw = dict(zip(self.inputs, args))
+        out = self.net(until=self.until, **kw)
+        if self.until in ("backbone", "encoder"):
+            return tuple(out[k] for k in self.output_names())
+        image = kw["image"]
+        h, w = image.shape[-2:]
+        xyxy, cxcywh = _xyxy(out["boxes"], w, h)
+        score, cls = out["logits"].sigmoid().max(-1)
+        b3 = out["box3d"]
+        depth = b3[..., 0].exp()
+        yaw = l2_normalize(b3[..., 1:3])
+        lwh = b3[..., 3:6].exp()
+        if "K" in kw:
+            K, T = kw["K"], kw["cam2ego"]
+            # boxes are in pixel-edge coordinates (x = 0 is the left image edge); K uses pixel centres (pixel i at i)
+            xc = (cxcywh[..., 0] - 0.5 - K[:, 0:1, 2]) / K[:, 0:1, 0] * depth
+            yc = (cxcywh[..., 1] - 0.5 - K[:, 1:2, 2]) / K[:, 1:2, 1] * depth
+            p = torch.stack([xc, yc, depth], 1)  # (B, 3, N)
+            e = T[:, :3, :3] @ p + T[:, :3, 3:4]
+            x_ego, y_ego = e[:, 0], e[:, 1]
+        else:
+            x_ego = y_ego = torch.zeros_like(depth)
+        agents = torch.cat([xyxy, score[..., None], cls[..., None].to(image.dtype), depth[..., None], yaw, lwh,
+                            x_ego[..., None], y_ego[..., None]], -1)
+        el_xyxy, _ = _xyxy(out["el_boxes"], w, h)
+        el_score, el_cls = out["el_logits"].sigmoid().max(-1)
+        attr_id, attr_p = _top1(out["el_attr_logits"])
+        sign_id, sign_p = _top1(out["el_sign_logits"])
+        elements = torch.cat([el_xyxy, el_score[..., None], el_cls[..., None].to(image.dtype), attr_id[..., None],
+                              attr_p[..., None], sign_id[..., None], sign_p[..., None]], -1)
+        lane_pts = torch.stack([out["lane_y"], out["lane_z"]], -1)
+        lane_vis = out["lane_vis_logits"].sigmoid()
+        o_id, o_p = _top1(out["lane_order_logits"])
+        o_val = torch.gather(self.order_values.expand(o_id.shape[0], -1), 1, o_id.long())
+        metas = [out["lane_exist_logits"].sigmoid(), o_val, o_p]
+        for k in ("lane_dir_logits", "lane_cont_logits", "lane_type_logits"):
+            metas += list(_top1(out[k]))
+        res = [agents, out["id_emb"], elements, lane_pts, lane_vis, torch.stack(metas, -1)]
+        if self.until == "full":
+            res.append(out["da_logits"].argmax(1).to(torch.int32))
+            if self.net.stereo is not None:
+                res.append(out["depth"])
+            if self.net.bev is not None:
+                res.append(out["bev"])
+        return tuple(res)
+
+
+def ground_depth(K: torch.Tensor, cam2ego: torch.Tensor, hw: Sequence[int], max_z: float = 40.0) -> torch.Tensor:
+    """(B, 1, H, W) depth of the flat ground (ego z = 0) seen through ``K`` / ``cam2ego``; 0 above the horizon or
+    beyond ``max_z``. Pixel-centre convention (pixel (u, v) is the ray through K^-1 (u, v, 1))."""
+    b = K.shape[0]
+    h, w = hw
+    v, u = torch.meshgrid(torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij")
+    ray = torch.stack([(u[None] - K[:, 0, 2].view(-1, 1, 1)) / K[:, 0, 0].view(-1, 1, 1),
+                       (v[None] - K[:, 1, 2].view(-1, 1, 1)) / K[:, 1, 1].view(-1, 1, 1),
+                       torch.ones(b, h, w)], 1)  # (B, 3, H, W) camera-frame directions
+    rz = (cam2ego[:, 2, :3].view(b, 3, 1, 1) * ray).sum(1)  # ego z component of the direction
+    d = -cam2ego[:, 2, 3].view(b, 1, 1) / rz
+    return torch.where((rz < -1e-6) & (d < max_z), d, torch.zeros_like(d))[:, None]
+
+
+def example_inputs(net: SparcNet, until: str = "full", batch: int = 1, seed: int = 0,
+                   K: Optional[torch.Tensor] = None, cam2ego: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+    """Plausible inputs for export / parity checks: a smooth image, a ground-plane depth map, a nominal camera."""
+    from sparc.data.schema import ground_cam2ego
+
+    h, w = net.cfg.imgsz
+    g = torch.Generator().manual_seed(seed)
+    img = torch.nn.functional.interpolate(torch.rand(batch, 3, h // 16, w // 16, generator=g), size=(h, w),
+                                          mode="bilinear", align_corners=False)
+    if K is None:
+        K = torch.tensor([[0.9 * w, 0, w / 2], [0, 0.9 * w, h / 2], [0, 0, 1]], dtype=torch.float32)
+    K = K.expand(batch, 3, 3).contiguous()
+    T = (cam2ego if cam2ego is not None else torch.tensor(ground_cam2ego(1.4, 0.03), dtype=torch.float32))
+    T = T.expand(batch, 4, 4).contiguous()
+    depth = ground_depth(K, T, (h, w), max_z=40.0)
+    out = {"image": img, "K": K, "cam2ego": T, "depth": depth,
+           "image_right": torch.roll(img, shifts=-4, dims=-1), "baseline": torch.full((batch, 1), 0.1)}
+    return {k: out[k] for k in net.input_names(until)}

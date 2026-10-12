@@ -22,6 +22,9 @@ ALIASES = {
     "dinov3_b": "vit_base_patch16_dinov3.lvd1689m",  # default
     "dinov3_l": "vit_large_patch16_dinov3.lvd1689m",
     "dinov3_h_plus": "vit_huge_plus_patch16_dinov3.lvd1689m",
+    # DINOv2 (Apache-2.0, not gated on the Hugging Face hub): fallback teachers when the DINOv3 licence is not accepted
+    "dinov2_s": "vit_small_patch14_dinov2.lvd142m",
+    "dinov2_b": "vit_base_patch14_dinov2.lvd142m",
 }
 DEFAULT_TEACHER = "dinov3_b"
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
