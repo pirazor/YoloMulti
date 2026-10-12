@@ -70,9 +70,9 @@ SOURCES = "auto"                                   # @param {type:"string"}
 DRIVE_DIR = "/content/drive/MyDrive/sparc"         # @param {type:"string"}
 RUN_NAME = ""                                      # @param {type:"string"}
 RESUME = True                                      # @param {type:"boolean"}
-BACKBONE = "auto"                                  # @param ["auto", "vit_t16_dinov3", "vit_s16_dinov2", "vit_s16_dinov3", "convnext_t_dinov3", "yolo26s"]
+BACKBONE = "vit_t16_dinov3"                        # @param ["vit_t16_dinov3", "vit_s16_dinov3", "convnext_t_dinov3", "yolo26s"]
 DISTILL = True                                     # @param {type:"boolean"}
-TEACHER = "auto"                                   # @param ["auto", "dinov3_b", "dinov2_b", "dinov3_s"]
+TEACHER = "dinov3_b"                               # @param ["dinov3_b", "dinov3_l", "dinov3_s"]
 EPOCHS = 0                                         # @param {type:"integer"}
 EPOCH_SIZE = 0                                     # @param {type:"integer"}
 BATCH = 0                                          # @param {type:"integer"}
@@ -310,9 +310,9 @@ plt.show()
 md("""
 ## 4 · Pretrained weights and configuration
 The default backbone is the DINOv3-distilled ViT-Tiny and the distillation teacher DINOv3 ViT-B. Their Hugging Face
-repositories are under the DINOv3 licence: if the download is refused, accept the licence on the model page (link
-printed below), add a Colab secret `HF_TOKEN` with a read token, and re-run; meanwhile the notebook falls back to the
-ungated DINOv2 weights (ViT-S backbone, ViT-B teacher). On a resumed run the saved configuration is reused.
+repositories are under the DINOv3 licence: if the download is refused, the notebook stops (it never trains with
+substitute weights). Accept the licence on the model page (link printed below), add a Colab secret `HF_TOKEN` with a
+read token, and re-run. On a resumed run the saved configuration is reused.
 """)
 code('''
 import math
@@ -375,20 +375,16 @@ if RESUMING:
     print(f"resuming {RUN_DIR} with its saved configuration (backbone {cfg.model.backbone})")
 else:
     backbone, teacher = BACKBONE, TEACHER
-    if backbone == "auto":
-        backbone = "vit_t16_dinov3" if not PRETRAINED or downloadable(timm_name("vit_t16_dinov3")) else "vit_s16_dinov2"
     if PRETRAINED and timm_name(backbone) and not downloadable(timm_name(backbone)):
         raise SystemExit(f"the {backbone} weights cannot be downloaded (see above): check the internet connection and "
                          "the HF_TOKEN secret, then re-run this cell")
     distill = DISTILL and PRETRAINED
-    if distill and teacher == "auto":
-        teacher = "dinov3_b" if downloadable("vit_base_patch16_dinov3.lvd1689m") else "dinov2_b"
     if distill and not downloadable(ALIASES.get(teacher, teacher)):
-        print(f"the teacher {teacher} cannot be downloaded: training without distillation")
-        distill = False
+        raise SystemExit(f"the teacher {teacher} cannot be downloaded (see above): accept its licence, add the "
+                         "HF_TOKEN secret and re-run this cell, or set DISTILL = False to train without a teacher")
     overrides = {"epochs": EPOCHS, "epoch_size": EPOCH_SIZE, "workers": WORKERS, "amp": AMP, "val_every": VAL_EVERY,
                  "log_every": LOG_EVERY, "model.backbone": backbone, "model.pretrained": PRETRAINED,
-                 "model.imgsz": list(IMGSZ), "distill.enabled": distill, "distill.teacher": teacher if distill else "dinov3_b"}
+                 "model.imgsz": list(IMGSZ), "distill.enabled": distill, "distill.teacher": teacher}
     cfg = TrainCfg.load(REPO / "sparc" / "cfg" / "stage_a.yaml", overrides)
     configure_batch(cfg, BATCH)
 CFG_FILE.write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=False))

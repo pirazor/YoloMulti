@@ -44,7 +44,7 @@ unpacks and converts them (`python -m sparc prepare`, conversions cached on Driv
 measures throughput and the expected training time, trains with resume across sessions, and ends with per-source
 metrics, the stage A acceptance table, prediction overlays and the ONNX export. Start with the `smoke` preset
 (synthetic data, ~15 min), then `quick`, then `full`. The default DINOv3 weights may need an `HF_TOKEN` Colab secret
-(the notebook falls back to DINOv2 otherwise). Regenerate it with `python colab/build_train_sparc.py`.
+(the notebook stops with instructions if the download is refused; it never substitutes other weights). Regenerate it with `python colab/build_train_sparc.py`.
 
 ## Train on Google Colab (adas_mt)
 
