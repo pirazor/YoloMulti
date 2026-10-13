@@ -1,4 +1,4 @@
-"""``python -m sparc <prepare|convert|synth|train|val|export|rig|profile|bakeoff> ...``"""
+"""``python -m sparc <download|prepare|convert|synth|train|val|export|rig|profile|bakeoff> ...``"""
 
 from __future__ import annotations
 
@@ -118,6 +118,12 @@ def cmd_prepare(a: argparse.Namespace) -> int:
     return prepare_main(a.rest)
 
 
+def cmd_download(a: argparse.Namespace) -> int:
+    from sparc.tools.download import main as download_main
+
+    return download_main(a.rest)
+
+
 def cmd_synth(a: argparse.Namespace) -> int:
     from sparc.data.synthetic import main as synth_main
 
@@ -202,6 +208,9 @@ def build_parser() -> argparse.ArgumentParser:
     e.add_argument("--opset", type=int, default=17)
     e.set_defaults(fn=cmd_export)
 
+    dl = sub.add_parser("download", help="fetch the public datasets that need no account: download -- --dest DIR")
+    dl.add_argument("rest", nargs=argparse.REMAINDER)
+    dl.set_defaults(fn=cmd_download)
     pp = sub.add_parser("prepare", help="dataset archives -> converted sources + manifests: prepare -- --datasets DIR --work DIR")
     pp.add_argument("rest", nargs=argparse.REMAINDER)
     pp.set_defaults(fn=cmd_prepare)

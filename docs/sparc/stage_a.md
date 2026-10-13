@@ -8,6 +8,7 @@ milestone that must beat the current `adas_mt` model on every output they share 
 ## Pipeline
 
 ```
+download  python -m sparc download -- --dest /drive/datasets --sources bdd100k,culane,tt100k        # public sets, resumable
 prepare   python -m sparc prepare -- --datasets /drive/datasets --work /data/sparc --cache /drive/cache   # unpack + convert + manifests
 convert   python -m sparc convert bdd100k -- --root /data/bdd100k --dst data/sparc/bdd100k --limit 200   # read the summary, then without --limit
           python -m sparc convert culane  -- --root /data/CULane   --dst data/sparc/culane

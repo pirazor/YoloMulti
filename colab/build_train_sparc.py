@@ -33,13 +33,25 @@ area. Everything that matters is written to Google Drive, so a disconnected sess
 
 **Before you start**
 1. *Runtime -> Change runtime type -> A100 GPU* (Colab Pro / Pro+). High-RAM is on by default for A100.
-2. Put the original dataset downloads on Google Drive, one folder per source under `DATASETS_DIR`
-   (default `MyDrive/datasets`). Only the folders you create are used; BDD100K is the core one.
+2. Datasets. The notebook **downloads the public ones itself** (`DOWNLOAD`, default `bdd100k,culane,tt100k`) into
+   `DATASETS_DIR` on Google Drive (default `MyDrive/datasets`, one folder per source), once: later sessions find them
+   complete and skip the download. That set alone trains every stage A output:
+
+| source | downloaded from | size | trains |
+|---|---|---|---|
+| BDD100K | ETH Zurich mirror (100k train + val images, det_20, drivable, lane labels) | ~6 GB | road users, light colour, drivable area, lanes |
+| CULane | official Google Drive files (train/val drivers, list, annotations_new; `CULANE_TEST` adds the test set) | ~40 GB | lanes with ego order, the CULane F1 benchmark |
+| TT100K | Tsinghua (`data.zip`, 2016 release) | ~20 GB | fine sign classes |
+
+   Google Drive needs about 70 GB free for these (a 100 GB / 2 TB Google One plan); with less, set `DATASETS_DIR` to
+   `/content/datasets` (local disk, downloaded again in every session). If Google Drive answers "too many users have
+   downloaded this file", its quota resets within a day: the cell names the file to fetch in the browser instead.
+
+   The sources below need an account, so they cannot be downloaded by a script; add them by hand when you have them
+   (same folder layout), they are picked up automatically:
 
 | folder | what to put in it (official file names) |
 |---|---|
-| `bdd100k/` | `bdd100k_images_100k.zip`, `bdd100k_det_20_labels_trainval.zip`, `bdd100k_drivable_labels_trainval.zip`, `bdd100k_lane_labels_trainval.zip` |
-| `culane/` | `driver_*_*frame.tar.gz` (6 files), `list.tar.gz`, `annotations_new.tar.gz` |
 | `mtsd/` | `mtsd_v2_fully_annotated_annotation.zip`, `mtsd_v2_fully_annotated_images.{{train.0,train.1,train.2,val}}.zip` |
 | `openlane/` | `images_training_*.tar` / `images_validation_*.tar` (a subset of the parts is fine), `lane3d_1000_v1.2.tar` |
 | `zod/` | the ZOD Frames download (archives or the unpacked `single_frames/` folder) |
@@ -66,6 +78,8 @@ md("## 1 · Settings")
 code('''
 PRESET = "smoke"                                   # @param ["smoke", "quick", "full"]
 DATASETS_DIR = "/content/drive/MyDrive/datasets"   # @param {type:"string"}
+DOWNLOAD = "bdd100k,culane,tt100k"                 # @param {type:"string"}
+CULANE_TEST = False                                # @param {type:"boolean"}
 SOURCES = "auto"                                   # @param {type:"string"}
 DRIVE_DIR = "/content/drive/MyDrive/sparc"         # @param {type:"string"}
 RUN_NAME = ""                                      # @param {type:"string"}
@@ -178,7 +192,7 @@ sys.path.insert(0, str(REPO))
 os.environ["PYTHONPATH"] = str(REPO) + os.pathsep + os.environ.get("PYTHONPATH", "")
 os.chdir(REPO)
 if not SKIP_INSTALL:
-    sh(f'{q(sys.executable)} -m pip install -q "ultralytics==8.4.171" "timm>=1.0.20" scipy onnx onnxruntime onnxslim')
+    sh(f'{q(sys.executable)} -m pip install -q "ultralytics==8.4.171" "timm>=1.0.20" scipy onnx onnxruntime onnxslim gdown')
 os.environ.setdefault("YOLO_OFFLINE", "1")  # no Ultralytics telemetry / update checks
 hf = secret("HF_TOKEN")
 if hf:
@@ -218,7 +232,8 @@ print(f"device {DEVICE} | amp {AMP} | batch {BATCH} | {WORKERS} data-loader work
 # ======================================================================================================== data
 md("""
 ## 3 · Data
-`sparc.tools.prepare` unpacks every source found in `DATASETS_DIR` to local disk, finds its root, converts it to SPARC
+`sparc.tools.download` fetches the public datasets listed in `DOWNLOAD` into `DATASETS_DIR` (resumable, MD5-checked,
+skipped when already complete). `sparc.tools.prepare` then unpacks every source found in `DATASETS_DIR` to local disk, finds its root, converts it to SPARC
 samples (sources in parallel) or restores the cached conversion from Drive, and writes the training manifests. The
 `smoke` preset generates synthetic road scenes instead. Read the conversion summaries: every skipped record is
 counted by reason.
@@ -245,8 +260,20 @@ if PRESET == "smoke":
     TRAIN_MANIFEST.write_text(yaml.safe_dump(m, sort_keys=False))
     VAL_FULL_MANIFEST.write_text(yaml.safe_dump({"train": m["train"], "val": [{"root": str(syn)}]}, sort_keys=False))
 else:
+    from sparc.tools.download import MANUAL, download
     from sparc.tools.prepare import discover, prepare, write_manifests
 
+    if DOWNLOAD.strip():
+        t0 = time.time()
+        try:
+            got = download(DATASETS_DIR, DOWNLOAD, culane_test=CULANE_TEST)
+        except RuntimeError as e:  # a failed source is named; the rest is on disk and the next run resumes
+            print(f"\\n{e}\\n\\nre-run this cell to resume; or remove the failing source from DOWNLOAD to go on without it")
+            raise SystemExit("download incomplete") from None
+        print(f"downloads complete in {(time.time() - t0) / 60:.0f} min: " + ", ".join(f"{k} ({len(v)} files)" for k, v in got.items()))
+    missing = [k for k in MANUAL if not (Path(DATASETS_DIR) / k).is_dir()]
+    if missing:
+        print("not present (need an account; optional):\\n" + "\\n".join(f"  {k:11s} {MANUAL[k]}" for k in missing))
     found = discover(DATASETS_DIR, SOURCES)
     if not found:
         raise SystemExit(f"no dataset folders in {DATASETS_DIR}: see the table at the top of the notebook")

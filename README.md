@@ -39,8 +39,8 @@ python -m sparc export --weights runs/sparc/stage_a/weights/best.pt   # ONNX + o
 
 **Stage A on a Colab A100**:
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/pirazor/YoloMulti/blob/multitask/colab/train_sparc.ipynb)
-[`colab/train_sparc.ipynb`](colab/train_sparc.ipynb) takes the original dataset downloads from a Google Drive folder,
-unpacks and converts them (`python -m sparc prepare`, conversions cached on Drive), checks the labels visually,
+[`colab/train_sparc.ipynb`](colab/train_sparc.ipynb) downloads the public datasets (BDD100K, CULane, TT100K; once, to
+Google Drive), adds any account-only ones you placed there, unpacks and converts them (`python -m sparc prepare`, conversions cached on Drive), checks the labels visually,
 measures throughput and the expected training time, trains with resume across sessions, and ends with per-source
 metrics, the stage A acceptance table, prediction overlays and the ONNX export. Start with the `smoke` preset
 (synthetic data, ~15 min), then `quick`, then `full`. The default DINOv3 weights may need an `HF_TOKEN` Colab secret
