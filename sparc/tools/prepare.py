@@ -54,10 +54,11 @@ class Spec:
     val: bool = True                  # has a validation split worth evaluating during training
     expand: float = 1.05              # extracted size / archive size (JPEG / PNG archives barely compress)
     args: Tuple[str, ...] = ()        # extra converter arguments
+    alias: Tuple[str, str] = ("", "")  # (dir, path): a download rooted at <dir> instead of the marker is linked as <path>
 
 
 SOURCES: Dict[str, Spec] = {
-    "bdd100k": Spec(("images/100k",), 0.35, 0, siblings=("labels",)),
+    "bdd100k": Spec(("images/100k",), 0.35, 0, siblings=("labels",), alias=("100k", "images/100k")),
     "culane": Spec(("list/train_gt.txt",), 0.10, 1),
     "mtsd": Spec(("splits/train.txt",), 0.06, 2, siblings=("annotations", "images")),
     "openlane": Spec(("lane3d_1000", "lane3d_300"), 0.15, 3, siblings=("images",)),
@@ -195,13 +196,23 @@ def find_root(base: Path, spec: Spec) -> Path:
             depth = len(root.relative_to(base).parts)
             if best is None or depth < best[0]:
                 best = (depth, root)
+    if best is None and spec.alias[0]:  # e.g. BDD100K's per-split image zips unpacked without bdd100k/images/
+        hits = sorted((p for p in base.rglob(spec.alias[0]) if p.is_dir() and any(c.is_dir() for c in p.iterdir())),
+                      key=lambda p: len(p.parts))
+        if hits:
+            link = base / spec.alias[1]
+            link.parent.mkdir(parents=True, exist_ok=True)
+            if not link.exists():
+                os.symlink(hits[0].resolve(), link)
+            LOG.info("linked %s -> %s", link, hits[0])
+            best = (0, base)
     if best is None:
         raise FileNotFoundError(f"none of {list(spec.markers)} found under {base}: is this the right download?")
     root = best[1]
     for sib in spec.siblings:
         if (root / sib).exists():
             continue
-        cands = sorted((p for p in base.rglob(sib) if p.is_dir() and root not in p.parents), key=lambda p: len(p.parts))
+        cands = sorted((p for p in base.rglob(sib) if p.is_dir() and p.parent != root), key=lambda p: len(p.parts))
         if cands:
             os.symlink(cands[0].resolve(), root / sib)
             LOG.info("linked %s -> %s", root / sib, cands[0])
